@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v3.8"
+APP_VERSION = "v3.8.1"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}

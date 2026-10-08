@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v3.8.5"
+APP_VERSION = "v3.8.6"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -89,7 +89,7 @@ DEFAULT_CONFIG = {
     "key_repeat": True,            # 按住的鍵持續送出訊號（模擬實體鍵盤按住）
     "minimize_on_start": True,     # 按開始時縮小本工具並切到遊戲
     "restore_on_pause": True,      # 暫停／停止時還原本工具視窗
-    "hotkeys": {"toggle": "f9", "stop": "f12", "record": "f10"},
+    "hotkeys": {"toggle": "f9", "stop": "f12", "record": "f8"},
     "topmost": True,
     "lie_detector": {"enabled": True, "threshold": 0.8, "beep": True},
     "elite": {
@@ -278,6 +278,10 @@ def migrate_config(cfg):
     if cfg.get("mode") not in ("anchor", "buff"):
         cfg["mode"] = "anchor"
     cfg.setdefault("combat", {})["enabled"] = False
+    # v3.8.6 起錄製結束改用 F8；先前預設的 F10 自動轉換，仍可在手動校正頁改回其他 F 鍵。
+    hotkeys = cfg.setdefault("hotkeys", {})
+    if hotkeys.get("record") in (None, "f10"):
+        hotkeys["record"] = "f8"
     return cfg
 
 
@@ -1185,7 +1189,7 @@ class Vision(threading.Thread):
 class KeyRecorder(threading.Thread):
     """錄製鍵盤與滑鼠點擊（輪詢 GetAsyncKeyState，不安裝任何鉤子）。
 
-    從第一個按鍵開始計時；按「錄製結束」熱鍵（預設 F10）結束，按「緊急停止」熱鍵取消。
+    從第一個按鍵開始計時；按「錄製結束」熱鍵（預設 F8）結束，按「緊急停止」熱鍵取消。
     """
 
     def __init__(self, app, on_done, max_sec=60):
@@ -1199,9 +1203,9 @@ class KeyRecorder(threading.Thread):
 
     def run(self):
         hk = self.app.cfg.get("hotkeys", {})
-        stop_vk = VK_FKEYS.get(hk.get("record", "f10"), 0x79)      # 結束錄製
+        stop_vk = VK_FKEYS.get(hk.get("record", "f8"), 0x77)       # 結束錄製
         cancel_vk = VK_FKEYS.get(hk.get("stop", "f12"), 0x7B)      # 取消錄製
-        skip = {VK_FKEYS.get(hk.get(k, d)) for k, d in (("toggle", "f9"), ("stop", "f12"), ("record", "f10"))}
+        skip = {VK_FKEYS.get(hk.get(k, d)) for k, d in (("toggle", "f9"), ("stop", "f12"), ("record", "f8"))}
         watch = {n: vk for n, vk in VK_NAMES.items() if n in SCANCODES and vk not in skip}
         # 啟動時已經按著的鍵（例如剛按的滑鼠/熱鍵）不算
         state = {n: bool(user32.GetAsyncKeyState(vk) & 0x8000) for n, vk in watch.items()} if IS_WIN else {}
@@ -3646,7 +3650,8 @@ class App:
         self.shared_tabs = {}
         for key, title, builder in (("skill", "技能／Buff", self.build_skill),
                                     ("alarm", "警報", self.build_alarm),
-                                    ("keys", "按鍵與熱鍵", self.build_keys)):
+                                    ("keys", "按鍵與熱鍵", self.build_keys),
+                                    ("adv", "手動校正", self.build_detect_adv)):
             sf = ScrollFrame(self.nb_shared)
             self.nb_shared.add(sf, text=" " + title + " ")
             inner = ttk.Frame(sf.inner, padding=(10, 8))
@@ -3813,7 +3818,7 @@ class App:
         g2 = ttk.Frame(box2)
         g2.pack(fill="x")
         src2 = {"hk_toggle": self.cfg["hotkeys"].get("toggle", "f9"), "hk_stop": self.cfg["hotkeys"].get("stop", "f12"),
-                "hk_record": self.cfg["hotkeys"].get("record", "f10"),
+                "hk_record": self.cfg["hotkeys"].get("record", "f8"),
                 "window_title": self.cfg["window_title"]}
         form_grid(g2, [("hk_toggle", "開始／暫停", FKEY_SPEC), ("hk_stop", "緊急停止", FKEY_SPEC),
                        ("hk_record", "錄製結束", FKEY_SPEC)], src2,
@@ -5120,7 +5125,7 @@ class App:
         self._rec_pill = tk.Toplevel(self.root)
         self._rec_pill.overrideredirect(True)
         self._rec_pill.attributes("-topmost", True)
-        tk.Label(self._rec_pill, text=f"● 錄製{what}中…　做完按 {hk.get('record', 'f10').upper()} 結束、"
+        tk.Label(self._rec_pill, text=f"● 錄製{what}中…　做完按 {hk.get('record', 'f8').upper()} 結束、"
                                        f"{hk.get('stop', 'f12').upper()} 取消",
                  bg=C_BAD, fg="white", font=(UI_FONT, 10, "bold"), padx=10, pady=4).pack()
         wl, wt, ww, wh = work_area(self.root)

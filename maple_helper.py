@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v3.8.8"
+APP_VERSION = "v3.8.9"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -57,7 +57,7 @@ MAPS_DIR = os.path.join(APP_DIR, "maps")
 MAP_PROFILE_KEYS = (
     "minimap", "player_hsv_low", "player_hsv_high", "min_dot_area",
     "route", "route_loop", "patrol", "patrol_opt", "goto_tolerance", "rope_tolerance",
-    "anchor", "mode", "loot", "map_macro",
+    "anchor", "mode", "loot", "map_macro", "map_macro_options",
 )
 
 # --------------------------------------------------------------------------
@@ -79,6 +79,8 @@ DEFAULT_CONFIG = {
     "route_loop": True,
     "mode": "route",  # "route" 照順序 / "random" 隨機巡邏
     "map_macro": None,  # 此地圖的完整鍵盤錄製（BUFF 機循環播放）
+    # record：完全照錄製時的按鍵／點擊播放；guarded：另外用小地圖座標監看偏移，偏太久即暫停。
+    "map_macro_options": {"play_mode": "record", "position_tolerance": 10},
     "patrol": [],     # {"type": "point"|"rope", "x", "y", "lands_y"(爬繩後落點，自動學習)}
     "patrol_opt": {"attack_min": 3, "attack_max": 8, "stay_min": 0.0, "stay_max": 2.0,
                    "x_jitter": 4, "plat_tol": 4, "rope_as_target": True},
@@ -620,6 +622,7 @@ class PlayerTracker:
         self.pos = None
         self.prev = []
         self.last_move = 0.0
+        self.missing_since = None
         self.candidates = []
 
     def seed(self, x, y):
@@ -638,8 +641,14 @@ class PlayerTracker:
         self.candidates = cands
         if not cands:
             self.prev = []
+            # 技能特效、UI 閃爍時常會讓角色點消失一兩幀。保留很短的最後位置，
+            # 避免座標顯示和錄製路徑不必要地跳成「--」；超過時間仍視為找不到。
+            self.missing_since = self.missing_since or now
+            if self.pos is not None and now - self.missing_since <= 0.35:
+                return self.pos
             self.pos = None
             return None
+        self.missing_since = None
         moved = []
         if self.prev:
             for c in cands:
@@ -1334,6 +1343,26 @@ def macro_summary(rec):
     return f"{detail}、{rec.get('duration', 0):.1f} 秒"
 
 
+def macro_position_at(path, elapsed):
+    """取得錄製路徑在指定時間的預期小地圖座標（相鄰採線性插值）。"""
+    rows = [r for r in (path or []) if isinstance(r, (list, tuple)) and len(r) >= 3]
+    if not rows:
+        return None
+    if elapsed <= float(rows[0][0]):
+        return int(rows[0][1]), int(rows[0][2])
+    previous = rows[0]
+    for current in rows[1:]:
+        t0, t1 = float(previous[0]), float(current[0])
+        if elapsed <= t1:
+            if t1 <= t0:
+                return int(current[1]), int(current[2])
+            fraction = (elapsed - t0) / (t1 - t0)
+            return (int(round(float(previous[1]) + (float(current[1]) - float(previous[1])) * fraction)),
+                    int(round(float(previous[2]) + (float(current[2]) - float(previous[2])) * fraction)))
+        previous = current
+    return int(previous[1]), int(previous[2])
+
+
 def infer_rope_segments(path, events):
     """由錄製期間的上／下鍵與小地圖座標軌跡，找出實際爬過的繩子。"""
     if len(path or []) < 3:
@@ -2017,6 +2046,10 @@ class Bot(threading.Thread):
             self.in_loot = True       # 全圖錄製優先完整重播，不中途轉去撿物
         try:
             t0 = time.perf_counter()
+            monitor_path = rec.get("path") if rec.get("play_mode") == "guarded" else None
+            monitor_tolerance = max(3, int(rec.get("position_tolerance", 10)))
+            monitor_bad_since = None
+            monitor_checked_at = 0.0
             for event in rec["events"]:
                 if isinstance(event, dict) and event.get("kind") == "mouse":
                     t = event.get("t", 0)
@@ -2028,6 +2061,26 @@ class Bot(threading.Thread):
                 while True:
                     wait_started = time.perf_counter()
                     self.check(allow_elite=False)
+                    # 「座標監看」不嘗試猜測地圖、也不亂按方向修正；只在連續偏離時安全暫停。
+                    # 這能避免傳送、斷線、被撞偏後仍把整段錄製操作送進遊戲。
+                    now = time.perf_counter()
+                    if monitor_path and now - monitor_checked_at >= 0.10:
+                        monitor_checked_at = now
+                        expected = macro_position_at(monitor_path, now - t0)
+                        actual = self.pos()
+                        if expected and actual:
+                            error = max(abs(actual[0] - expected[0]), abs(actual[1] - expected[1]))
+                            if error > monitor_tolerance:
+                                monitor_bad_since = monitor_bad_since or now
+                                if now - monitor_bad_since >= 0.8:
+                                    self.status = (f"路徑座標偏離 {error} 格（容許 {monitor_tolerance}），"
+                                                   "已安全暫停")
+                                    self.active.clear()
+                                    self.app.ui(lambda: (self.app._after_pause(), self.app.notify(
+                                        "錄製路徑與目前座標偏離，已暫停；請回到錄製起點後再開始。", error=True)))
+                                    return False
+                            else:
+                                monitor_bad_since = None
                     # 全圖錄製播放時，只在沒有按住移動鍵的空檔補 Buff；補 Buff 的時間不算進錄製節奏。
                     if allow_buffs and not pressed:
                         self.tick_skills()
@@ -3152,6 +3205,13 @@ class App:
                                                 actual.get("weight", "normal"), actual.get("slant", "roman"))
                     family, points, weight, slant = widget._ui_base_font
                     widget.configure(font=(family, max(7, int(round(points * ratio))), weight, slant))
+                    if isinstance(widget, tk.Button):
+                        if not hasattr(widget, "_ui_base_padding"):
+                            widget._ui_base_padding = (int(float(widget.cget("padx"))),
+                                                       int(float(widget.cget("pady"))))
+                        padx, pady = widget._ui_base_padding
+                        widget.configure(padx=max(2, int(round(padx * ratio))),
+                                         pady=max(1, int(round(pady * ratio))))
                 except (tk.TclError, ValueError, TypeError):
                     pass
             self._rescale_plain_widgets(widget, ratio)
@@ -3185,9 +3245,15 @@ class App:
         self.lbl_win.pack(side="left", padx=(6, 0))
         btns = ttk.Frame(top)
         btns.pack(side="right")
-        self.btn_run = ttk.Button(btns, text="▶ 開始", style="Big.TButton", command=self.toggle_run)
+        # Windows 的 vista ttk 主題會強制保留大按鈕的最小高度，縮小時看起來不會跟著字變小。
+        # 這兩顆改為原生 Tk 按鈕，便可由 _rescale_plain_widgets 同步字級和內距。
+        self.btn_run = tk.Button(btns, text="▶ 開始", font=(UI_FONT, 10, "bold"), padx=9, pady=4,
+                                 relief="groove", bd=1, bg="#e8f1ff", activebackground="#d6e6ff",
+                                 command=self.toggle_run)
         self.btn_run.pack(side="left")
-        self.btn_stop = ttk.Button(btns, text="■ 停止", style="Big.TButton", command=self.stop)
+        self.btn_stop = tk.Button(btns, text="■ 停止", font=(UI_FONT, 10, "bold"), padx=9, pady=4,
+                                  relief="groove", bd=1, bg="#f4f4f5", activebackground="#e5e7eb",
+                                  command=self.stop)
         self.btn_stop.pack(side="left", padx=(6, 0))
         self.lbl_status = ttk.Label(hd, text="", style="Status.TLabel")
         self.lbl_status.pack(anchor="w", pady=(6, 0))
@@ -3366,11 +3432,16 @@ class App:
                 if key in self.cfg["loot"]:
                     var.set(str(self.cfg["loot"][key]))
             self.var_loot_tap.set(self.cfg["loot"].get("auto_tap", True))
+        if hasattr(self, "var_map_play_mode"):
+            opts = self.cfg.get("map_macro_options", {})
+            self.var_map_play_mode.set(opts.get("play_mode", "record"))
         self.update_map_macro_label()
         if hasattr(self, "tv_route"):
             self.reload_route()
-        self.reload_patrol()
-        self.update_anchor_label()
+        if hasattr(self, "tv_patrol"):
+            self.reload_patrol()
+        if hasattr(self, "lbl_anchor"):
+            self.update_anchor_label()
         self.show_mode_panel()
         if hasattr(self, "wiz_rows"):
             self.rebuild_wizard()
@@ -3551,8 +3622,17 @@ class App:
     # ---------------- BUFF機 ----------------
     def build_loot(self, host):
         f = ttk.Frame(host)
-        macro = section(f, "整張地圖錄製", "錄下鍵盤、遊戲視窗內的滑鼠點擊，以及小地圖座標路徑。錄完後，BUFF 機按「開始」會先放 Buff，再從頭循環播放。")
+        macro = section(f, "整張地圖錄製", "錄下鍵盤、遊戲視窗內的滑鼠點擊，以及小地圖座標路徑。開始後會先放 Buff，再循環播放。")
         button_row(macro, [("● 錄製整張地圖", self.record_map_macro), ("清除錄製", self.clear_map_macro)])
+        opts = self.cfg.get("map_macro_options", {})
+        self.var_map_play_mode = tk.StringVar(value=opts.get("play_mode", "record"))
+        play = ttk.Frame(macro)
+        play.pack(anchor="w", pady=(5, 0))
+        ttk.Label(play, text="播放方式：").pack(side="left")
+        ttk.Radiobutton(play, text="照錄製操作（建議）", value="record", variable=self.var_map_play_mode,
+                        command=self.save_map_macro_options).pack(side="left")
+        ttk.Radiobutton(play, text="座標監看，偏離時暫停", value="guarded", variable=self.var_map_play_mode,
+                        command=self.save_map_macro_options).pack(side="left", padx=(8, 0))
         self.lbl_map_macro = ttk.Label(macro, text="", style="Hint.TLabel")
         self.lbl_map_macro.pack(anchor="w", pady=(3, 0))
         self.update_map_macro_label()
@@ -5254,13 +5334,28 @@ class App:
             return
         rec = self.cfg.get("map_macro")
         if rec and rec.get("events"):
-            self.lbl_map_macro.config(text=f"目前錄製：{macro_summary(rec)}。BUFF 機會循環播放。")
+            mode = rec.get("play_mode", self.cfg.get("map_macro_options", {}).get("play_mode", "record"))
+            suffix = "座標監看已啟用，偏離會自動暫停。" if mode == "guarded" else "會照錄製操作循環播放。"
+            self.lbl_map_macro.config(text=f"目前錄製：{macro_summary(rec)}。{suffix}")
         else:
             self.lbl_map_macro.config(text="尚未錄製；BUFF 機仍可原地放 Buff／撿物。")
+
+    def save_map_macro_options(self):
+        mode = self.var_map_play_mode.get() if hasattr(self, "var_map_play_mode") else "record"
+        self.cfg.setdefault("map_macro_options", {})["play_mode"] = mode
+        rec = self.cfg.get("map_macro")
+        if rec:
+            rec["play_mode"] = mode
+            rec.setdefault("position_tolerance", 10)
+        save_config(self.cfg)
+        self.update_map_macro_label()
 
     def record_map_macro(self):
         def saved(rec):
             rec.pop("start_img", None)
+            options = self.cfg.get("map_macro_options", {})
+            rec["play_mode"] = options.get("play_mode", "record")
+            rec["position_tolerance"] = int(options.get("position_tolerance", 10))
             self.cfg["map_macro"] = rec
             save_config(self.cfg)
             self.update_map_macro_label()

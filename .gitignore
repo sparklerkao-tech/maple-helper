@@ -205,6 +205,13 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Maple Helper local data — never publish personal settings, maps, or image templates.
+config.json
+maps/
+templates/
+diag/
+maple_helper_備份_改版前.py
+
 # Ruff stuff:
 .ruff_cache/
 

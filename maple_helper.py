@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v3.8.4"
+APP_VERSION = "v3.8.5"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -3049,14 +3049,18 @@ class App:
         root.title(f"楓之谷輔助工具 {APP_VERSION}")
         init_ui_metrics(root)
         wl, wt, ww, wh = work_area(root)
-        w = min(px(720), ww - 20)
-        h = min(px(880), wh - 40)
+        # 預設改為緊湊尺寸；仍可自由拉大。
+        w = min(px(640), ww - 20)
+        h = min(px(760), wh - 40)
         # 預設放在螢幕右側，避免蓋住遊戲左上角的小地圖
         root.geometry(f"{w}x{h}+{wl + max(0, ww - w - 20)}+{wt + 10}")
-        root.minsize(min(px(600), ww - 20), min(px(560), wh - 40))
+        root.minsize(min(px(460), ww - 20), min(px(440), wh - 40))
         root.attributes("-topmost", self.cfg.get("topmost", True))
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._base_tk_scaling = float(root.tk.call("tk", "scaling"))
+        self._ui_ratio = None
         self._setup_style()
+        root.bind("<Configure>", self._on_root_resize, add="+")
 
         self.alarm_kind = None   # None / "red" / "lie" / "stuck"
         self._ui_queue = queue.Queue()   # 背景執行緒要更新介面時，放進這裡由主執行緒執行
@@ -3106,17 +3110,39 @@ class App:
                 st.theme_use("vista")
             except Exception:
                 pass
-        base = (UI_FONT, 10)
+        self._style = st
+        self._apply_ui_ratio(1.0)
+
+    def _apply_ui_ratio(self, ratio):
+        """視窗變窄時同步縮小字體與 ttk 間距，讓內容不只剩外框變小。"""
+        ratio = max(0.72, min(1.0, ratio))
+        if self._ui_ratio is not None and abs(self._ui_ratio - ratio) < 0.025:
+            return
+        self._ui_ratio = ratio
+        # 字體使用 Tk 的全域 scaling 縮放，避免字級與 scaling 被重複縮小。
+        size = lambda n: n
+        st = self._style
+        base = (UI_FONT, size(9))
         st.configure(".", font=base)
-        st.configure("TLabelframe.Label", font=(UI_FONT, 10, "bold"), foreground="#374151")
-        st.configure("Hint.TLabel", foreground=C_MUTED, font=(UI_FONT, 9))
-        st.configure("Link.TLabel", foreground=C_ACCENT, font=(UI_FONT, 9, "bold"))
-        st.configure("Pos.TLabel", font=(UI_FONT, 17, "bold"))
-        st.configure("Status.TLabel", foreground=C_ACCENT, font=(UI_FONT, 10, "bold"))
-        st.configure("Big.TButton", font=(UI_FONT, 11, "bold"), padding=(14, 6))
-        st.configure("Treeview", rowheight=px(24))
-        st.configure("Treeview.Heading", font=(UI_FONT, 9, "bold"))
+        st.configure("TLabelframe.Label", font=(UI_FONT, size(9), "bold"), foreground="#374151")
+        st.configure("Hint.TLabel", foreground=C_MUTED, font=(UI_FONT, size(8)))
+        st.configure("Link.TLabel", foreground=C_ACCENT, font=(UI_FONT, size(8), "bold"))
+        st.configure("Pos.TLabel", font=(UI_FONT, size(15), "bold"))
+        st.configure("Status.TLabel", foreground=C_ACCENT, font=(UI_FONT, size(9), "bold"))
+        st.configure("Big.TButton", font=(UI_FONT, size(10), "bold"), padding=(size(9), size(4)))
+        st.configure("Treeview", rowheight=max(px(17), int(px(21) * ratio)))
+        st.configure("Treeview.Heading", font=(UI_FONT, size(8), "bold"))
         self.root.option_add("*Font", base)
+        try:
+            self.root.tk.call("tk", "scaling", self._base_tk_scaling * ratio)
+        except tk.TclError:
+            pass
+
+    def _on_root_resize(self, event):
+        if event.widget is not self.root:
+            return
+        # 以緊湊預設寬度為基準；拉大不放大，縮小才等比例收斂。
+        self._apply_ui_ratio(event.width / max(1, px(640)))
 
     # ---------------- 上方狀態列 ----------------
     def build_header(self, root):

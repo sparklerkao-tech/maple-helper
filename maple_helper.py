@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v3.8.2"
+APP_VERSION = "v3.8.3"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -5297,23 +5297,27 @@ class App:
                      if os.path.isfile(os.path.join(payload, n))]
             if "maple_helper.py" not in names:
                 raise ValueError("更新檔不完整")
-            script = os.path.join(stage, "apply_update.cmd")
-            quoted_names = " ".join(f'"{n}"' for n in names)
-            with open(script, "w", encoding="utf-8") as f:
-                f.write("@echo off\r\n")
-                f.write("timeout /t 2 /nobreak >nul\r\n")
-                f.write(f'robocopy "{payload}" "{APP_DIR}" {quoted_names} /R:2 /W:1 /NFL /NDL /NJH /NJS\r\n')
-                f.write(f'start "" "{os.path.join(APP_DIR, "啟動.bat")}"\r\n')
-                f.write('del "%~f0"\r\n')
-            self.ui(lambda: self.finish_update(script))
+            self.ui(lambda: self.finish_update(payload, names))
         except Exception as e:
             self.ui(lambda: self.notify(f"下載更新失敗：{e}", error=True))
 
-    def finish_update(self, script):
+    def finish_update(self, payload, names):
         if not self.alive_ui:
             return
         self.notify("下載完成，正在更新並重新開啟…")
-        subprocess.Popen(["cmd", "/c", script], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        # 不使用 .cmd：cmd 對中文資料夾／檔名的編碼常會變成亂碼。
+        # 以 Unicode 參數直接啟動短暫的 Python 更新助手，保留使用者的設定與地圖資料。
+        helper = (
+            "import json,os,shutil,subprocess,sys,time;"
+            "time.sleep(1.5);"
+            "src,dst,py,entry,names=sys.argv[1:6];"
+            "[shutil.copy2(os.path.join(src,n),os.path.join(dst,n)) for n in json.loads(names) "
+            "if os.path.isfile(os.path.join(src,n))];"
+            "subprocess.Popen([py,entry],cwd=dst)"
+        )
+        subprocess.Popen([sys.executable, "-c", helper, payload, APP_DIR, sys.executable,
+                          os.path.join(APP_DIR, "maple_helper.py"), json.dumps(names, ensure_ascii=False)],
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.root.after(300, self.on_close)
 
     def on_close(self):

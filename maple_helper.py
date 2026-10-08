@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v3.8.9"
+APP_VERSION = "v3.9.0"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -57,7 +57,7 @@ MAPS_DIR = os.path.join(APP_DIR, "maps")
 MAP_PROFILE_KEYS = (
     "minimap", "player_hsv_low", "player_hsv_high", "min_dot_area",
     "route", "route_loop", "patrol", "patrol_opt", "goto_tolerance", "rope_tolerance",
-    "anchor", "mode", "loot", "map_macro", "map_macro_options",
+    "anchor", "mode", "loot", "map_macro", "map_macros", "map_macro_options",
 )
 
 # --------------------------------------------------------------------------
@@ -79,6 +79,7 @@ DEFAULT_CONFIG = {
     "route_loop": True,
     "mode": "route",  # "route" 照順序 / "random" 隨機巡邏
     "map_macro": None,  # 此地圖的完整鍵盤錄製（BUFF 機循環播放）
+    "map_macros": [],    # 多條完整錄製路線；BUFF 機每輪隨機選一條
     # record：完全照錄製時的按鍵／點擊播放；guarded：另外用小地圖座標監看偏移，偏太久即暫停。
     "map_macro_options": {"play_mode": "record", "position_tolerance": 10},
     "patrol": [],     # {"type": "point"|"rope", "x", "y", "lands_y"(爬繩後落點，自動學習)}
@@ -279,6 +280,14 @@ def migrate_config(cfg):
         a["points"] = [[a["x"], a["y"]]]
     if cfg.get("mode") not in ("anchor", "buff"):
         cfg["mode"] = "anchor"
+    # 舊版只有一條 map_macro。升級後自動把它保留為第一條隨機路線。
+    routes = cfg.setdefault("map_macros", [])
+    legacy = cfg.get("map_macro")
+    if not routes and isinstance(legacy, dict) and legacy.get("events"):
+        routes.append(legacy)
+    cfg["map_macros"] = [r for r in routes if isinstance(r, dict) and r.get("events")]
+    if cfg["map_macros"]:
+        cfg["map_macro"] = cfg["map_macros"][0]  # 保留相容舊版讀取位置
     cfg.setdefault("combat", {})["enabled"] = False
     # v3.8.6 起錄製結束改用 F8；先前預設的 F10 自動轉換，仍可在手動校正頁改回其他 F 鍵。
     hotkeys = cfg.setdefault("hotkeys", {})
@@ -1476,6 +1485,7 @@ class Bot(threading.Thread):
         self.loot_tries = {}
         self.loot_k = None         # 畫面 px / 小地圖 px（移動中自動學習）
         self.loot_k_hist = []
+        self.last_map_macro_index = None
         threading.Thread(target=self._loot_tapper, daemon=True).start()
 
     # ---- 工具 ----
@@ -1485,6 +1495,21 @@ class Bot(threading.Thread):
 
     def key(self, role):
         return self.cfg["keys"][role]
+
+    def choose_map_macro(self):
+        """每一輪從完整錄製路線中隨機挑一條，盡量不連續重複。"""
+        routes = [r for r in self.cfg.get("map_macros", []) if isinstance(r, dict) and r.get("events")]
+        if not routes:
+            legacy = self.cfg.get("map_macro")
+            routes = [legacy] if isinstance(legacy, dict) and legacy.get("events") else []
+        if not routes:
+            return None, None
+        choices = list(range(len(routes)))
+        if len(choices) > 1 and self.last_map_macro_index in choices:
+            choices.remove(self.last_map_macro_index)
+        index = random.choice(choices)
+        self.last_map_macro_index = index
+        return routes[index], index
 
     def elite_present(self):
         el = self.cfg.get("elite", {})
@@ -2714,10 +2739,12 @@ class Bot(threading.Thread):
                     self.anchor_once()
                     continue
                 if self.cfg.get("mode") == "buff":
-                    map_macro = self.cfg.get("map_macro")
+                    map_macro, map_macro_index = self.choose_map_macro()
                     if map_macro and map_macro.get("events"):
                         # 錄好的全圖路徑優先；每輪結束後會再次檢查到期的 Buff。
                         self.tick_skills()
+                        if map_macro_index is not None:
+                            self.status = f"隨機路線 {map_macro_index + 1}／{len(self.cfg.get('map_macros') or [map_macro])}：準備播放"
                         self.play_macro(map_macro, align=False, suppress_loot=True, allow_buffs=True)
                     elif self.loot_targets()[1]:
                         self.loot_items()
@@ -3623,7 +3650,7 @@ class App:
     def build_loot(self, host):
         f = ttk.Frame(host)
         macro = section(f, "整張地圖錄製", "錄下鍵盤、遊戲視窗內的滑鼠點擊，以及小地圖座標路徑。開始後會先放 Buff，再循環播放。")
-        button_row(macro, [("● 錄製整張地圖", self.record_map_macro), ("清除錄製", self.clear_map_macro)])
+        button_row(macro, [("＋ 錄製隨機路線", self.record_map_macro), ("清除全部路線", self.clear_map_macro)])
         opts = self.cfg.get("map_macro_options", {})
         self.var_map_play_mode = tk.StringVar(value=opts.get("play_mode", "record"))
         play = ttk.Frame(macro)
@@ -5332,19 +5359,27 @@ class App:
     def update_map_macro_label(self):
         if not hasattr(self, "lbl_map_macro"):
             return
-        rec = self.cfg.get("map_macro")
-        if rec and rec.get("events"):
-            mode = rec.get("play_mode", self.cfg.get("map_macro_options", {}).get("play_mode", "record"))
+        routes = self.map_macro_routes()
+        if routes:
+            mode = routes[0].get("play_mode", self.cfg.get("map_macro_options", {}).get("play_mode", "record"))
             suffix = "座標監看已啟用，偏離會自動暫停。" if mode == "guarded" else "會照錄製操作循環播放。"
-            self.lbl_map_macro.config(text=f"目前錄製：{macro_summary(rec)}。{suffix}")
+            summaries = "；".join(f"#{i + 1} {macro_summary(rec)}" for i, rec in enumerate(routes))
+            self.lbl_map_macro.config(text=f"已錄製 {len(routes)} 條路線，BUFF 機每輪隨機選一條：{summaries}。{suffix}")
         else:
             self.lbl_map_macro.config(text="尚未錄製；BUFF 機仍可原地放 Buff／撿物。")
+
+    def map_macro_routes(self):
+        routes = [r for r in self.cfg.get("map_macros", []) if isinstance(r, dict) and r.get("events")]
+        if not routes:
+            legacy = self.cfg.get("map_macro")
+            if isinstance(legacy, dict) and legacy.get("events"):
+                routes = [legacy]
+        return routes
 
     def save_map_macro_options(self):
         mode = self.var_map_play_mode.get() if hasattr(self, "var_map_play_mode") else "record"
         self.cfg.setdefault("map_macro_options", {})["play_mode"] = mode
-        rec = self.cfg.get("map_macro")
-        if rec:
+        for rec in self.map_macro_routes():
             rec["play_mode"] = mode
             rec.setdefault("position_tolerance", 10)
         save_config(self.cfg)
@@ -5356,23 +5391,28 @@ class App:
             options = self.cfg.get("map_macro_options", {})
             rec["play_mode"] = options.get("play_mode", "record")
             rec["position_tolerance"] = int(options.get("position_tolerance", 10))
-            self.cfg["map_macro"] = rec
+            routes = self.map_macro_routes()
+            routes.append(rec)
+            self.cfg["map_macros"] = routes
+            self.cfg["map_macro"] = routes[0]  # 兼容已有地圖檔與舊版資料
             save_config(self.cfg)
             self.update_map_macro_label()
-            self.notify(f"已記錄整張地圖路徑（{macro_summary(rec)}）。切到 BUFF 機後按開始即可循環播放。")
+            self.notify(f"已加入第 {len(routes)} 條隨機路線（{macro_summary(rec)}）。")
 
         # 全圖跑法通常較長，最多可錄十分鐘；按設定的「錄製結束」熱鍵可隨時完成。
         self.start_recording("整張地圖", saved, max_sec=600)
 
     def clear_map_macro(self):
-        if not self.cfg.get("map_macro"):
+        if not self.map_macro_routes():
             return
-        if not messagebox.askyesno("清除錄製", "確定清除這張地圖的完整錄製？"):
+        if not messagebox.askyesno("清除錄製", "確定清除這張地圖的全部隨機路線？"):
             return
         self.cfg["map_macro"] = None
+        self.cfg["map_macros"] = []
+        self.bot.last_map_macro_index = None
         save_config(self.cfg)
         self.update_map_macro_label()
-        self.notify("已清除整張地圖錄製。")
+        self.notify("已清除全部隨機路線。")
 
     def _after_start(self):
         """開始後：縮小本工具、把遊戲切到前景"""

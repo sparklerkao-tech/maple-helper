@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v3.9.0"
+APP_VERSION = "v3.9.1"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -94,6 +94,7 @@ DEFAULT_CONFIG = {
     "restore_on_pause": True,      # 暫停／停止時還原本工具視窗
     "hotkeys": {"toggle": "f10", "stop": "f12", "record": "f8"},
     "topmost": True,
+    "yolo_dataset": {"interval_sec": 2.0},  # AI 資料收集的自動截圖間隔
     "lie_detector": {"enabled": True, "threshold": 0.8, "beep": True},
     "elite": {
         "enabled": False,
@@ -172,6 +173,9 @@ TAG_DIR = os.path.join(TEMPLATE_DIR, "char")
 TAG_PATH = os.path.join(TAG_DIR, "nametag.png")
 ITEM_DIR = os.path.join(TEMPLATE_DIR, "items")
 ROPE_DIR = os.path.join(TEMPLATE_DIR, "ropes")
+YOLO_DATA_DIR = os.path.join(APP_DIR, "yolo_data")
+YOLO_IMAGES_DIR = os.path.join(YOLO_DATA_DIR, "images")
+YOLO_LABELS_DIR = os.path.join(YOLO_DATA_DIR, "labels")
 
 
 def imread_unicode(path):
@@ -3149,6 +3153,8 @@ class App:
         root.bind("<Configure>", self._on_root_resize, add="+")
 
         self.alarm_kind = None   # None / "red" / "lie" / "stuck"
+        self.yolo_collecting = False
+        self._yolo_capture_job = None
         self._ui_queue = queue.Queue()   # 背景執行緒要更新介面時，放進這裡由主執行緒執行
         self._note_job = None
         self._tick = 0
@@ -3771,6 +3777,7 @@ class App:
         self.shared_tabs = {}
         for key, title, builder in (("skill", "技能／Buff", self.build_skill),
                                     ("alarm", "警報", self.build_alarm),
+                                    ("yolo", "AI 資料", self.build_yolo_dataset),
                                     ("keys", "按鍵與熱鍵", self.build_keys),
                                     ("adv", "手動校正", self.build_detect_adv)):
             sf = ScrollFrame(self.nb_shared)
@@ -3783,6 +3790,159 @@ class App:
     def open_shared(self, key):
         self.nb.select(self.tab_shared)
         self.nb_shared.select(self.shared_tabs[key])
+
+    # ---------------- YOLO 資料收集 ----------------
+    def _ensure_yolo_dirs(self):
+        os.makedirs(YOLO_IMAGES_DIR, exist_ok=True)
+        os.makedirs(YOLO_LABELS_DIR, exist_ok=True)
+
+    def _yolo_image_files(self):
+        self._ensure_yolo_dirs()
+        return sorted((n for n in os.listdir(YOLO_IMAGES_DIR) if n.lower().endswith(".png")), reverse=True)
+
+    def build_yolo_dataset(self, f):
+        box = section(f, "怪物資料收集（實驗）",
+                      "開始後會定時保存遊戲完整畫面。先收集怪物；之後選取圖片、框住每一隻怪物，即可產生 YOLO 訓練標註。")
+        row = ttk.Frame(box)
+        row.pack(fill="x")
+        self.var_yolo_interval = tk.StringVar(value=str(self.cfg.get("yolo_dataset", {}).get("interval_sec", 2.0)))
+        ttk.Label(row, text="每隔（秒）").pack(side="left")
+        interval = ttk.Entry(row, textvariable=self.var_yolo_interval, width=6)
+        interval.pack(side="left", padx=(6, 12))
+        interval.bind("<FocusOut>", lambda _: self.save_yolo_dataset_options())
+        interval.bind("<Return>", lambda _: self.save_yolo_dataset_options())
+        self.btn_yolo_collect = ttk.Button(row, text="開始收集", command=self.toggle_yolo_collection)
+        self.btn_yolo_collect.pack(side="left")
+        ttk.Button(row, text="立即截圖", command=self.capture_yolo_image).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text="開啟資料夾", command=self.open_yolo_dir).pack(side="left", padx=(6, 0))
+        self.lbl_yolo_dataset = ttk.Label(box, text="", style="Hint.TLabel")
+        self.lbl_yolo_dataset.pack(anchor="w", pady=(5, 0))
+
+        labels = section(f, "框選標註", "選一張圖片後按「標註怪物」，用滑鼠逐一框住怪物；可框多隻，Enter 儲存，Backspace 復原最後一框。")
+        body = ttk.Frame(labels)
+        body.pack(fill="both", expand=True)
+        self.lb_yolo_images = tk.Listbox(body, height=9, exportselection=False)
+        self.lb_yolo_images.pack(side="left", fill="both", expand=True)
+        side = ttk.Frame(body)
+        side.pack(side="left", fill="y", padx=(8, 0))
+        ttk.Button(side, text="重新整理", command=self.refresh_yolo_dataset).pack(fill="x")
+        ttk.Button(side, text="標註怪物", command=self.annotate_yolo_image).pack(fill="x", pady=(6, 0))
+        ttk.Button(side, text="下一張未標註", command=self.select_next_yolo_unlabeled).pack(fill="x", pady=(6, 0))
+        self.refresh_yolo_dataset()
+
+    def save_yolo_dataset_options(self):
+        try:
+            interval = float(self.var_yolo_interval.get())
+            if interval < 0.5 or interval > 60:
+                raise ValueError
+        except ValueError:
+            self.notify("資料截圖間隔請填 0.5～60 秒", error=True)
+            return False
+        self.cfg.setdefault("yolo_dataset", {})["interval_sec"] = interval
+        save_config(self.cfg)
+        return True
+
+    def refresh_yolo_dataset(self):
+        if not hasattr(self, "lb_yolo_images"):
+            return
+        names = self._yolo_image_files()
+        previous = self.selected_yolo_image()
+        self.lb_yolo_images.delete(0, "end")
+        labeled = 0
+        for name in names:
+            stem = os.path.splitext(name)[0]
+            done = os.path.isfile(os.path.join(YOLO_LABELS_DIR, stem + ".txt"))
+            labeled += int(done)
+            self.lb_yolo_images.insert("end", ("✓ " if done else "○ ") + name)
+        if names:
+            target = next((i for i, name in enumerate(names) if name == previous), 0)
+            self.lb_yolo_images.selection_set(target)
+            self.lb_yolo_images.see(target)
+        state = "收集中" if self.yolo_collecting else "已停止"
+        self.lbl_yolo_dataset.config(text=f"{state}｜已收集 {len(names)} 張，已標註 {labeled} 張。資料只保存在本機 yolo_data 資料夾。")
+
+    def selected_yolo_image(self):
+        if not hasattr(self, "lb_yolo_images"):
+            return None
+        picked = self.lb_yolo_images.curselection()
+        if not picked:
+            return None
+        text = self.lb_yolo_images.get(picked[0])
+        return text[2:] if len(text) > 2 else text
+
+    def capture_yolo_image(self, quiet=False):
+        img = self.vision.grab_client() if IS_WIN else None
+        if img is None:
+            if not quiet:
+                self.notify("找不到遊戲視窗，無法截圖。", error=True)
+            return False
+        self._ensure_yolo_dirs()
+        name = f"maple_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1_000_000_000:09d}.png"
+        path = os.path.join(YOLO_IMAGES_DIR, name)
+        if not imwrite_unicode(path, img):
+            self.notify("儲存資料圖片失敗。", error=True)
+            return False
+        self.refresh_yolo_dataset()
+        if not quiet:
+            self.notify(f"已收集圖片：{name}")
+        return True
+
+    def toggle_yolo_collection(self):
+        if self.yolo_collecting:
+            self.yolo_collecting = False
+            if self._yolo_capture_job:
+                self.root.after_cancel(self._yolo_capture_job)
+                self._yolo_capture_job = None
+            self.btn_yolo_collect.config(text="開始收集")
+            self.refresh_yolo_dataset()
+            return
+        if not self.save_yolo_dataset_options():
+            return
+        if not self.vision.hwnd:
+            self.notify("請先開啟並選取遊戲視窗。", error=True)
+            return
+        self.yolo_collecting = True
+        self.btn_yolo_collect.config(text="停止收集")
+        self._yolo_capture_tick()
+
+    def _yolo_capture_tick(self):
+        if not self.yolo_collecting or not self.alive_ui:
+            return
+        self.capture_yolo_image(quiet=True)
+        interval_ms = int(float(self.cfg.get("yolo_dataset", {}).get("interval_sec", 2.0)) * 1000)
+        self._yolo_capture_job = self.root.after(max(500, interval_ms), self._yolo_capture_tick)
+
+    def select_next_yolo_unlabeled(self):
+        names = self._yolo_image_files()
+        for i, name in enumerate(names):
+            if not os.path.isfile(os.path.join(YOLO_LABELS_DIR, os.path.splitext(name)[0] + ".txt")):
+                self.lb_yolo_images.selection_clear(0, "end")
+                self.lb_yolo_images.selection_set(i)
+                self.lb_yolo_images.see(i)
+                return
+        self.notify("目前所有收集到的圖片都已標註。")
+
+    def annotate_yolo_image(self):
+        name = self.selected_yolo_image()
+        if not name:
+            self.notify("請先從清單選一張圖片。", error=True)
+            return
+        image_path = os.path.join(YOLO_IMAGES_DIR, name)
+        img = imread_unicode(image_path)
+        if img is None:
+            self.notify("讀取圖片失敗。", error=True)
+            return
+        label_path = os.path.join(YOLO_LABELS_DIR, os.path.splitext(name)[0] + ".txt")
+
+        def saved(count):
+            self.refresh_yolo_dataset()
+            self.notify(f"已儲存 {count} 個怪物標註。")
+        YoloBoxAnnotator(self.root, img, label_path, saved)
+
+    def open_yolo_dir(self):
+        self._ensure_yolo_dirs()
+        if IS_WIN:
+            os.startfile(YOLO_DATA_DIR)
 
     def build_skill(self, f):
         box = section(f, "Buff／定時技能", "每隔設定的秒數自動施放一次；按開始時，所有啟用的技能會先各放一次。雙擊可編輯。")
@@ -5576,6 +5736,12 @@ class App:
 
     def on_close(self):
         self.alive_ui = False
+        self.yolo_collecting = False
+        if self._yolo_capture_job:
+            try:
+                self.root.after_cancel(self._yolo_capture_job)
+            except tk.TclError:
+                pass
         if hasattr(self, "diag"):
             self.diag.running = False
         self.scanner.running = False
@@ -5657,6 +5823,109 @@ class RectSelector(tk.Toplevel):
         if self.sel and self.sel[2] > 5 and self.sel[3] > 5:
             self.callback(self.sel)
             self.destroy()
+
+
+class YoloBoxAnnotator(tk.Toplevel):
+    """簡化的 YOLO 標註器：單一類別「怪物」，可在同一張圖片框選多隻。"""
+
+    def __init__(self, parent, img_bgr, label_path, callback):
+        super().__init__(parent)
+        self.title("框選怪物：拖曳可新增多個框，Enter 儲存，Backspace 復原")
+        self.attributes("-topmost", True)
+        self.img = img_bgr
+        self.label_path = label_path
+        self.callback = callback
+        self.h, self.w = img_bgr.shape[:2]
+        sw, sh = self.winfo_screenwidth() - 80, self.winfo_screenheight() - 180
+        self.scale = min(1.0, sw / self.w, sh / self.h)
+        disp = cv2.resize(img_bgr, (max(1, int(self.w * self.scale)), max(1, int(self.h * self.scale))))
+        self.tkimg = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)))
+        self.cv = tk.Canvas(self, width=disp.shape[1], height=disp.shape[0], cursor="cross")
+        self.cv.pack()
+        self.cv.create_image(0, 0, anchor="nw", image=self.tkimg)
+        self.boxes = self._load_existing()
+        self.start = None
+        self.preview = None
+        self._draw_boxes()
+        controls = ttk.Frame(self)
+        controls.pack(fill="x", padx=6, pady=6)
+        ttk.Label(controls, text="類別：怪物").pack(side="left")
+        ttk.Button(controls, text="復原最後一框", command=self.undo).pack(side="right")
+        ttk.Button(controls, text="儲存標註", command=self.save).pack(side="right", padx=(0, 6))
+        self.cv.bind("<ButtonPress-1>", self.on_down)
+        self.cv.bind("<B1-Motion>", self.on_drag)
+        self.cv.bind("<ButtonRelease-1>", self.on_up)
+        self.bind("<Return>", self.save)
+        self.bind("<BackSpace>", lambda _: self.undo())
+        self.bind("<Escape>", lambda _: self.destroy())
+        self.focus_force()
+
+    def _load_existing(self):
+        boxes = []
+        if not os.path.isfile(self.label_path):
+            return boxes
+        try:
+            with open(self.label_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) != 5 or parts[0] != "0":
+                        continue
+                    cx, cy, bw, bh = (float(v) for v in parts[1:])
+                    w, h = bw * self.w, bh * self.h
+                    boxes.append((max(0, cx * self.w - w / 2), max(0, cy * self.h - h / 2), w, h))
+        except (OSError, ValueError):
+            pass
+        return boxes
+
+    def _draw_boxes(self):
+        self.cv.delete("yolo_box")
+        for x, y, w, h in self.boxes:
+            self.cv.create_rectangle(x * self.scale, y * self.scale, (x + w) * self.scale, (y + h) * self.scale,
+                                     outline="#00ff66", width=2, tags="yolo_box")
+
+    def on_down(self, event):
+        self.start = (event.x, event.y)
+        if self.preview:
+            self.cv.delete(self.preview)
+        self.preview = self.cv.create_rectangle(event.x, event.y, event.x, event.y, outline="#ffcc00", width=2)
+
+    def on_drag(self, event):
+        if self.start and self.preview:
+            self.cv.coords(self.preview, self.start[0], self.start[1], event.x, event.y)
+
+    def on_up(self, event):
+        if not self.start:
+            return
+        x0, x1 = sorted((self.start[0], event.x))
+        y0, y1 = sorted((self.start[1], event.y))
+        self.start = None
+        if self.preview:
+            self.cv.delete(self.preview)
+            self.preview = None
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return
+        s = self.scale
+        self.boxes.append((x0 / s, y0 / s, (x1 - x0) / s, (y1 - y0) / s))
+        self._draw_boxes()
+
+    def undo(self):
+        if self.boxes:
+            self.boxes.pop()
+            self._draw_boxes()
+
+    def save(self, _event=None):
+        os.makedirs(os.path.dirname(self.label_path), exist_ok=True)
+        lines = []
+        for x, y, w, h in self.boxes:
+            x, y = max(0, min(x, self.w)), max(0, min(y, self.h))
+            w, h = min(w, self.w - x), min(h, self.h - y)
+            if w < 2 or h < 2:
+                continue
+            lines.append(f"0 {(x + w / 2) / self.w:.6f} {(y + h / 2) / self.h:.6f} {w / self.w:.6f} {h / self.h:.6f}")
+        with open(self.label_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+        self.callback(len(lines))
+        self.destroy()
 
 
 class ColorPicker(tk.Toplevel):

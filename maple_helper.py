@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v3.8.3"
+APP_VERSION = "v3.8.4"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -1308,6 +1308,7 @@ class KeyRecorder(threading.Thread):
                    "end": list(end_pos) if end_pos else None,
                    "duration": end_t,
                    "path": positions,
+                   "ropes": infer_rope_segments(positions, events),
                    "start_img": self.start_img}
         self.app.ui(lambda: self.on_done(rec, self.cancelled))
 
@@ -1321,7 +1322,72 @@ def macro_summary(rec):
     points = len(rec.get("path") or [])
     if points:
         detail += f"、{points} 個座標"
+    ropes = len(rec.get("ropes") or [])
+    if ropes:
+        detail += f"、{ropes} 條繩子"
     return f"{detail}、{rec.get('duration', 0):.1f} 秒"
+
+
+def infer_rope_segments(path, events):
+    """由錄製期間的上／下鍵與小地圖座標軌跡，找出實際爬過的繩子。"""
+    if len(path or []) < 3:
+        return []
+    keys = [e for e in events if isinstance(e, (list, tuple)) and len(e) >= 3]
+    keys.sort(key=lambda e: float(e[0]))
+    held, ei, runs = set(), 0, []
+    current = None
+    for a, b in zip(path, path[1:]):
+        if len(a) < 3 or len(b) < 3:
+            continue
+        t, x, y = float(a[0]), int(a[1]), int(a[2])
+        nt, nx, ny = float(b[0]), int(b[1]), int(b[2])
+        while ei < len(keys) and float(keys[ei][0]) <= t:
+            _kt, name, down = keys[ei][:3]
+            if name in ("up", "down"):
+                (held.add if down else held.discard)(name)
+            ei += 1
+        direction = "up" if "up" in held else ("down" if "down" in held else None)
+        vertical = (ny - y) * (-1 if direction == "up" else 1) if direction else 0
+        # 繩子上通常 X 幾乎不動，且與按住的方向一致；跳躍、平台位移會被排除。
+        valid = direction and vertical > 0 and abs(nx - x) <= 2 and nt > t
+        if valid:
+            if current and (current["direction"] != direction or abs(x - current["xs"][-1]) > 3):
+                runs.append(current)
+                current = None
+            if current is None:
+                current = {"direction": direction, "start_t": t, "end_t": nt,
+                           "points": [(x, y), (nx, ny)], "xs": [x, nx]}
+            else:
+                current["end_t"] = nt
+                current["points"].append((nx, ny))
+                current["xs"].append(nx)
+        elif current:
+            runs.append(current)
+            current = None
+    if current:
+        runs.append(current)
+
+    ropes = []
+    for run in runs:
+        pts = run["points"]
+        ys = [p[1] for p in pts]
+        span = max(ys) - min(ys)
+        if span < 5 or run["end_t"] - run["start_t"] < 0.15:
+            continue
+        x = int(round(sum(run["xs"]) / len(run["xs"])))
+        ropes.append({"x": x, "bottom_y": max(ys), "top_y": min(ys),
+                      "direction": run["direction"], "duration": round(run["end_t"] - run["start_t"], 2)})
+    # 同一條繩子往返爬時只保留一份範圍最大的資料。
+    merged = []
+    for rope in ropes:
+        same = next((r for r in merged if abs(r["x"] - rope["x"]) <= 2
+                     and not (rope["bottom_y"] < r["top_y"] - 2 or rope["top_y"] > r["bottom_y"] + 2)), None)
+        if same:
+            same["bottom_y"] = max(same["bottom_y"], rope["bottom_y"])
+            same["top_y"] = min(same["top_y"], rope["top_y"])
+        else:
+            merged.append(rope)
+    return merged
 
 
 class StopBot(Exception):
@@ -3338,7 +3404,7 @@ class App:
         legend = "黃十字＝角色　灰虛圈＝已忽略的同色圖示　紅圈＝其他玩家"
         legend += "　青框＝定點"
         if mode == "buff":
-            legend += "　青線＝錄製路徑　綠圈＝起點　粉圈＝終點"
+            legend += "　青線＝錄製路徑　綠圈＝起點　粉圈＝終點　橘線＝自動讀取的繩子"
         self.lbl_legend.config(text="小地圖：" + legend)
         self.mode_scroll.to_top()
 
@@ -4077,7 +4143,8 @@ class App:
                                              outline="#00e5ff" if cur else "#4dd0e1", width=3 if cur else 1)
                 self.canvas.create_text(ax + 9, ay - 9, text=str(i + 1), fill="#00e5ff", font=("Arial", 8))
         if mode == "buff":
-            path = (self.cfg.get("map_macro") or {}).get("path") or []
+            recorded = self.cfg.get("map_macro") or {}
+            path = recorded.get("path") or []
             pts = [(ox + int(row[1]) * scale, int(row[2]) * scale)
                    for row in path if isinstance(row, (list, tuple)) and len(row) >= 3
                    and 0 <= int(row[1]) < w and 0 <= int(row[2]) < h]
@@ -4085,6 +4152,11 @@ class App:
                 self.canvas.create_line(*[v for pt in pts for v in pt], fill="#00e5ff", width=2)
                 for px_, py_, color in ((pts[0][0], pts[0][1], "#69f0ae"), (pts[-1][0], pts[-1][1], "#ff80ab")):
                     self.canvas.create_oval(px_ - 4, py_ - 4, px_ + 4, py_ + 4, outline=color, width=2)
+            for rope in recorded.get("ropes") or []:
+                x, bottom, top = int(rope.get("x", -1)), int(rope.get("bottom_y", -1)), int(rope.get("top_y", -1))
+                if 0 <= x < w and 0 <= top < h and 0 <= bottom < h:
+                    self.canvas.create_line(ox + x * scale, top * scale, ox + x * scale, bottom * scale,
+                                            fill="#ff9800", width=3)
         for cx_, cy_, _a in list(self.vision.tracker.candidates):
             if p and (cx_, cy_) == tuple(p):
                 continue

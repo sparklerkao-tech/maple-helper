@@ -6,7 +6,7 @@
 - 路線循環：走到指定 X、爬繩、跳躍、下跳、等待、攻擊
 不讀寫遊戲記憶體、不修改遊戲檔案。
 
-熱鍵：F9 開始/暫停   F12 緊急停止
+熱鍵：F10 開始/暫停   F12 緊急停止
 """
 import ctypes
 import json
@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v3.8.6"
+APP_VERSION = "v3.8.7"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -89,7 +89,7 @@ DEFAULT_CONFIG = {
     "key_repeat": True,            # 按住的鍵持續送出訊號（模擬實體鍵盤按住）
     "minimize_on_start": True,     # 按開始時縮小本工具並切到遊戲
     "restore_on_pause": True,      # 暫停／停止時還原本工具視窗
-    "hotkeys": {"toggle": "f9", "stop": "f12", "record": "f8"},
+    "hotkeys": {"toggle": "f10", "stop": "f12", "record": "f8"},
     "topmost": True,
     "lie_detector": {"enabled": True, "threshold": 0.8, "beep": True},
     "elite": {
@@ -280,6 +280,8 @@ def migrate_config(cfg):
     cfg.setdefault("combat", {})["enabled"] = False
     # v3.8.6 起錄製結束改用 F8；先前預設的 F10 自動轉換，仍可在手動校正頁改回其他 F 鍵。
     hotkeys = cfg.setdefault("hotkeys", {})
+    if hotkeys.get("toggle") in (None, "f9"):
+        hotkeys["toggle"] = "f10"
     if hotkeys.get("record") in (None, "f10"):
         hotkeys["record"] = "f8"
     return cfg
@@ -1205,7 +1207,7 @@ class KeyRecorder(threading.Thread):
         hk = self.app.cfg.get("hotkeys", {})
         stop_vk = VK_FKEYS.get(hk.get("record", "f8"), 0x77)       # 結束錄製
         cancel_vk = VK_FKEYS.get(hk.get("stop", "f12"), 0x7B)      # 取消錄製
-        skip = {VK_FKEYS.get(hk.get(k, d)) for k, d in (("toggle", "f9"), ("stop", "f12"), ("record", "f8"))}
+        skip = {VK_FKEYS.get(hk.get(k, d)) for k, d in (("toggle", "f10"), ("stop", "f12"), ("record", "f8"))}
         watch = {n: vk for n, vk in VK_NAMES.items() if n in SCANCODES and vk not in skip}
         # 啟動時已經按著的鍵（例如剛按的滑鼠/熱鍵）不算
         state = {n: bool(user32.GetAsyncKeyState(vk) & 0x8000) for n, vk in watch.items()} if IS_WIN else {}
@@ -3817,7 +3819,7 @@ class App:
         box2 = section(f, "熱鍵與視窗")
         g2 = ttk.Frame(box2)
         g2.pack(fill="x")
-        src2 = {"hk_toggle": self.cfg["hotkeys"].get("toggle", "f9"), "hk_stop": self.cfg["hotkeys"].get("stop", "f12"),
+        src2 = {"hk_toggle": self.cfg["hotkeys"].get("toggle", "f10"), "hk_stop": self.cfg["hotkeys"].get("stop", "f12"),
                 "hk_record": self.cfg["hotkeys"].get("record", "f8"),
                 "window_title": self.cfg["window_title"]}
         form_grid(g2, [("hk_toggle", "開始／暫停", FKEY_SPEC), ("hk_stop", "緊急停止", FKEY_SPEC),
@@ -4050,7 +4052,7 @@ class App:
         if not self.alive_ui:
             return
         v, b = self.vision, self.bot
-        hk_t = self.cfg["hotkeys"].get("toggle", "f9").upper()
+        hk_t = self.cfg["hotkeys"].get("toggle", "f10").upper()
         hk_s = self.cfg["hotkeys"].get("stop", "f12").upper()
         p = v.get_pos()
         self.lbl_pos.config(text=f"座標  X {p[0]}   Y {p[1]}" if p else "座標 --")
@@ -5333,13 +5335,13 @@ class App:
             return
         if IS_WIN:
             hk = self.cfg.get("hotkeys", {})
-            pairs = ((hk.get("toggle", "f9"), self.toggle_run), (hk.get("stop", "f12"), self.stop))
+            pairs = ((hk.get("toggle", "f10"), self.toggle_run), (hk.get("stop", "f12"), self.stop))
             for name, fn in pairs:
                 vk = VK_FKEYS.get(str(name).lower())
                 if vk is None:
                     continue
                 down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
-                # 工具自己剛送出同一個鍵（例如技能設成 F9）時不算熱鍵
+                # 工具自己剛送出同一個鍵（例如技能設成 F10）時不算熱鍵
                 injected = time.time() - self.kb.last_sent.get(str(name).lower(), 0) < 0.6
                 if down and not self._hotkey_state.get(vk) and not injected:
                     # 停止鍵任何時候都有效（安全）；開始/暫停只在遊戲或本工具在前景時有效

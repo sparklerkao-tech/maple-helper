@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v3.8.1"
+APP_VERSION = "v3.8.2"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -1207,8 +1207,22 @@ class KeyRecorder(threading.Thread):
         state = {n: bool(user32.GetAsyncKeyState(vk) & 0x8000) for n, vk in watch.items()} if IS_WIN else {}
         mouse_state = {n: bool(user32.GetAsyncKeyState(vk) & 0x8000) for n, vk in MOUSE_BUTTONS.items()} if IS_WIN else {}
         hotkey_down = True   # 等熱鍵先放開，避免一開始就被當成「結束」
-        events, t0, start_pos = [], None, None
+        events, positions, t0, start_pos = [], [], None, None
+        last_coord = None
         begin = time.perf_counter()
+
+        def sample_position(now, force=False):
+            nonlocal last_coord
+            if t0 is None:
+                return
+            p = self.app.vision.get_pos()
+            if p is None:
+                return
+            point = (int(p[0]), int(p[1]))
+            # 座標有變化就記下；同一點不重複存，長時間錄製也不會膨脹。
+            if force or point != last_coord:
+                positions.append([round(now - t0, 3), point[0], point[1]])
+                last_coord = point
 
         def begin_record(now):
             nonlocal t0, start_pos
@@ -1216,6 +1230,7 @@ class KeyRecorder(threading.Thread):
                 return True
             t0 = now
             start_pos = self.app.vision.get_pos()
+            sample_position(now, force=True)
             try:
                 self.start_img = self.app.vision.grab_client()
             except Exception:
@@ -1267,6 +1282,7 @@ class KeyRecorder(threading.Thread):
                         if pos is not None:
                             events.append({"t": round(now - t0, 4), "kind": "mouse", "button": n,
                                            "down": 1 if down else 0, "x": pos[0], "y": pos[1]})
+                sample_position(now)
             time.sleep(0.004)
         self.active = False
         if t0 is not None:   # 結束時還按著的鍵補上放開
@@ -1286,10 +1302,12 @@ class KeyRecorder(threading.Thread):
         rec = None
         if not self.cancelled and events:
             end_pos = self.app.vision.get_pos()
+            sample_position(time.perf_counter(), force=True)
             rec = {"events": events,
                    "start": list(start_pos) if start_pos else None,
                    "end": list(end_pos) if end_pos else None,
-                   "duration": events[-1][0],
+                   "duration": end_t,
+                   "path": positions,
                    "start_img": self.start_img}
         self.app.ui(lambda: self.on_done(rec, self.cancelled))
 
@@ -1300,6 +1318,9 @@ def macro_summary(rec):
     keys = sum(1 for e in rec["events"] if isinstance(e, (list, tuple)) and len(e) >= 3 and e[2])
     clicks = sum(1 for e in rec["events"] if isinstance(e, dict) and e.get("kind") == "mouse" and e.get("down"))
     detail = f"{keys} 個按鍵" + (f"、{clicks} 次點擊" if clicks else "")
+    points = len(rec.get("path") or [])
+    if points:
+        detail += f"、{points} 個座標"
     return f"{detail}、{rec.get('duration', 0):.1f} 秒"
 
 
@@ -3316,6 +3337,8 @@ class App:
         self.pn[mode].pack(fill="x")
         legend = "黃十字＝角色　灰虛圈＝已忽略的同色圖示　紅圈＝其他玩家"
         legend += "　青框＝定點"
+        if mode == "buff":
+            legend += "　青線＝錄製路徑　綠圈＝起點　粉圈＝終點"
         self.lbl_legend.config(text="小地圖：" + legend)
         self.mode_scroll.to_top()
 
@@ -3418,7 +3441,7 @@ class App:
     # ---------------- BUFF機 ----------------
     def build_loot(self, host):
         f = ttk.Frame(host)
-        macro = section(f, "整張地圖錄製", "像 TinyTask 一樣錄下跑圖的鍵盤操作與遊戲視窗內的滑鼠點擊。錄完後，BUFF 機按「開始」會先放 Buff，再從頭循環播放這段路徑。")
+        macro = section(f, "整張地圖錄製", "錄下鍵盤、遊戲視窗內的滑鼠點擊，以及小地圖座標路徑。錄完後，BUFF 機按「開始」會先放 Buff，再從頭循環播放。")
         button_row(macro, [("● 錄製整張地圖", self.record_map_macro), ("清除錄製", self.clear_map_macro)])
         self.lbl_map_macro = ttk.Label(macro, text="", style="Hint.TLabel")
         self.lbl_map_macro.pack(anchor="w", pady=(3, 0))
@@ -4053,6 +4076,15 @@ class App:
                 self.canvas.create_rectangle(ax - 6, ay - 6, ax + 6, ay + 6,
                                              outline="#00e5ff" if cur else "#4dd0e1", width=3 if cur else 1)
                 self.canvas.create_text(ax + 9, ay - 9, text=str(i + 1), fill="#00e5ff", font=("Arial", 8))
+        if mode == "buff":
+            path = (self.cfg.get("map_macro") or {}).get("path") or []
+            pts = [(ox + int(row[1]) * scale, int(row[2]) * scale)
+                   for row in path if isinstance(row, (list, tuple)) and len(row) >= 3
+                   and 0 <= int(row[1]) < w and 0 <= int(row[2]) < h]
+            if len(pts) >= 2:
+                self.canvas.create_line(*[v for pt in pts for v in pt], fill="#00e5ff", width=2)
+                for px_, py_, color in ((pts[0][0], pts[0][1], "#69f0ae"), (pts[-1][0], pts[-1][1], "#ff80ab")):
+                    self.canvas.create_oval(px_ - 4, py_ - 4, px_ + 4, py_ + 4, outline=color, width=2)
         for cx_, cy_, _a in list(self.vision.tracker.candidates):
             if p and (cx_, cy_) == tuple(p):
                 continue

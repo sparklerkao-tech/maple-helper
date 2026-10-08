@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v3.8.7"
+APP_VERSION = "v3.8.8"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -3125,8 +3125,7 @@ class App:
         if self._ui_ratio is not None and abs(self._ui_ratio - ratio) < 0.025:
             return
         self._ui_ratio = ratio
-        # 字體使用 Tk 的全域 scaling 縮放，避免字級與 scaling 被重複縮小。
-        size = lambda n: n
+        size = lambda n: max(7, int(round(n * ratio)))
         st = self._style
         base = (UI_FONT, size(9))
         st.configure(".", font=base)
@@ -3139,10 +3138,23 @@ class App:
         st.configure("Treeview", rowheight=max(px(17), int(px(21) * ratio)))
         st.configure("Treeview.Heading", font=(UI_FONT, size(8), "bold"))
         self.root.option_add("*Font", base)
-        try:
-            self.root.tk.call("tk", "scaling", self._base_tk_scaling * ratio)
-        except tk.TclError:
-            pass
+        self._rescale_plain_widgets(self.root, ratio)
+
+    def _rescale_plain_widgets(self, parent, ratio):
+        """ttk 以 style 縮放；一般 Tk 控制項則逐一調整，確保已建立的內容真的會變小。"""
+        plain = (tk.Label, tk.Button, tk.Radiobutton, tk.Checkbutton, tk.Entry, tk.Listbox)
+        for widget in parent.winfo_children():
+            if isinstance(widget, plain):
+                try:
+                    if not hasattr(widget, "_ui_base_font"):
+                        actual = tkfont.Font(root=self.root, font=widget.cget("font")).actual()
+                        widget._ui_base_font = (actual.get("family", UI_FONT), abs(int(actual.get("size", 9))),
+                                                actual.get("weight", "normal"), actual.get("slant", "roman"))
+                    family, points, weight, slant = widget._ui_base_font
+                    widget.configure(font=(family, max(7, int(round(points * ratio))), weight, slant))
+                except (tk.TclError, ValueError, TypeError):
+                    pass
+            self._rescale_plain_widgets(widget, ratio)
 
     def _on_root_resize(self, event):
         if event.widget is not self.root:
@@ -5123,6 +5135,8 @@ class App:
         if not self.vision.hwnd:
             self.notify("找不到遊戲視窗，無法錄製。", error=True)
             return
+        # 預設跳躍鍵可能是 Alt；錄製前一定釋放殘留按鍵，避免下一個 Z 觸發 NVIDIA 的 Alt+Z 覆蓋介面。
+        self.kb.release_all()
         hk = self.cfg["hotkeys"]
         self._rec_pill = tk.Toplevel(self.root)
         self._rec_pill.overrideredirect(True)

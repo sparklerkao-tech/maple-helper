@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.0.2"
+APP_VERSION = "v4.0.3"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -100,6 +100,8 @@ DEFAULT_CONFIG = {
         "model": "yolo_data/models/monster_current_map_v2.pt",
         "confidence": 0.45,
         "imgsz": 960,
+        # 路線爬繩時，先用畫面上的 YOLO 繩子框做最後對位；沒有結果會自動退回原本的小地圖／微調流程。
+        "rope_assist": True,
     },
     "lie_detector": {"enabled": True, "threshold": 0.8, "beep": True},
     "elite": {
@@ -1829,6 +1831,39 @@ class Bot(threading.Thread):
         self._px_time = px_time
         return False
 
+    def yolo_align_rope(self, max_distance=180):
+        """依畫面辨識到的繩子做最後水平對位。
+
+        小地圖座標先負責走到「哪一根繩子」附近；這一步再用 YOLO 的繩子框修正實際畫面
+        的左右誤差，特別適合小地圖格子與角色實際抓繩點不完全一致的情況。
+        找不到人物名牌、模型或足夠近的繩子時安全地交回既有流程。
+        """
+        yolo_cfg = self.cfg.get("yolo", {})
+        detector = self.app.scanner.yolo
+        tag = self.app.scanner.tag_template
+        if not yolo_cfg.get("rope_assist", True) or tag is None or not detector.has_class("rope"):
+            return False
+        img = self.app.vision.grab_client()
+        char = locate_char(img, tag)
+        ropes = detector.detect_classes(img, "rope") if img is not None else None
+        if char is None or not ropes:
+            return False
+        char_x = char[0]
+        rope = min(ropes, key=lambda r: abs(r[0] - char_x))
+        delta = int(rope[0] - char_x)
+        if abs(delta) > max_distance:
+            return False
+        if abs(delta) <= 4:
+            self.status = "YOLO 繩子對位完成"
+            return True
+        # 只做一次短距離修正；接下來仍由 grab_rope 的微調保證不會因誤判跑到遠處。
+        px_time = self.__dict__.get("_px_time", 0.008)
+        hold = min(0.38, max(0.025, abs(delta) * px_time))
+        self.status = f"YOLO 繩子對位：差 {delta:+d} px"
+        self.kb.tap(self.key("right") if delta > 0 else self.key("left"), hold)
+        self.sleep(0.10, do_skills=False)
+        return True
+
     def nudge_to(self, tx, max_taps=6):
         """短按方向鍵，一格一格挪到 tx（不放開已按住的上／下鍵）"""
         for _ in range(max_taps):
@@ -1913,6 +1948,8 @@ class Bot(threading.Thread):
             self.sleep(0.12, do_skills=False)
             if anchor:
                 self.screen_align(anchor)
+            # 即使尚未為這根繩子建立畫面地標，也可以用訓練好的 YOLO 繩子類別完成最後對位。
+            self.yolo_align_rope()
             p0 = self.pos()
             if p0 is None:
                 continue
@@ -1941,6 +1978,7 @@ class Bot(threading.Thread):
         if not self.goto(rope_x, tol=self.cfg["rope_tolerance"]):
             return False
         self.sleep(0.12, do_skills=False)
+        self.yolo_align_rope()
         p0 = self.pos()
         if p0 is None:
             return False
@@ -3926,11 +3964,14 @@ class App:
         runtime = section(f, "YOLO 怪物辨識", "這張地圖的模型會優先用於怪物辨識；沒有模型或 YOLO 環境時會保留舊範本辨識。全自動戰鬥仍維持關閉。")
         yc = self.cfg.get("yolo", {})
         self.var_yolo_enabled = tk.BooleanVar(value=yc.get("enabled", True))
+        self.var_yolo_rope_assist = tk.BooleanVar(value=yc.get("rope_assist", True))
         self.var_yolo_conf = tk.StringVar(value=str(yc.get("confidence", 0.45)))
         row2 = ttk.Frame(runtime)
         row2.pack(fill="x")
         ttk.Checkbutton(row2, text="啟用此地圖 YOLO 模型", variable=self.var_yolo_enabled,
                         command=self.save_yolo_runtime).pack(side="left")
+        ttk.Checkbutton(row2, text="爬繩時畫面對位", variable=self.var_yolo_rope_assist,
+                        command=self.save_yolo_runtime).pack(side="left", padx=(10, 0))
         ttk.Label(row2, text="信心門檻").pack(side="left", padx=(14, 5))
         entry_conf = ttk.Entry(row2, textvariable=self.var_yolo_conf, width=6)
         entry_conf.pack(side="left")
@@ -3969,6 +4010,7 @@ class App:
             return False
         yc = self.cfg.setdefault("yolo", {})
         yc["enabled"] = self.var_yolo_enabled.get()
+        yc["rope_assist"] = self.var_yolo_rope_assist.get()
         yc["confidence"] = confidence
         yc.setdefault("model", "yolo_data/models/monster_current_map_v2.pt")
         yc.setdefault("imgsz", 960)

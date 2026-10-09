@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.0.1"
+APP_VERSION = "v4.0.2"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -93,7 +93,7 @@ DEFAULT_CONFIG = {
     "minimize_on_start": True,     # 按開始時縮小本工具並切到遊戲
     "restore_on_pause": True,      # 暫停／停止時還原本工具視窗
     "hotkeys": {"toggle": "f10", "stop": "f12", "record": "f8"},
-    "topmost": True,
+    "topmost": False,
     "yolo_dataset": {"interval_sec": 2.0},  # AI 資料收集的自動截圖間隔
     "yolo": {
         "enabled": True,
@@ -308,6 +308,10 @@ def migrate_config(cfg):
         hotkeys["toggle"] = "f10"
     if hotkeys.get("record") in (None, "f10"):
         hotkeys["record"] = "f8"
+    # v4.0.2 起預設不置頂，避免設定視窗長時間遮住遊戲；使用者仍可在設定頁手動開啟。
+    if not cfg.get("topmost_preference_migrated"):
+        cfg["topmost"] = False
+        cfg["topmost_preference_migrated"] = True
     return cfg
 
 
@@ -899,8 +903,12 @@ def detect_motion_targets(img_bgr, previous_gray, cb, char):
     return gray, out
 
 
-def analyze_items(img_bgr, loot, cb, item_tpls):
+def analyze_items(img_bgr, loot, cb, item_tpls, yolo=None):
     """找地上物品，回傳 [(x, y, score, name)]（原始解析度）"""
+    if yolo is not None and yolo.has_class("item"):
+        detected = yolo.detect_classes(img_bgr, "item")
+        if detected is not None:
+            return detected
     if not item_tpls:
         return []
     s = float(loot.get("scale", 1.0))
@@ -933,6 +941,16 @@ class YoloMonsterDetector:
     def available(self):
         cfg = self.app.cfg.get("yolo", {})
         return bool(cfg.get("enabled") and os.path.isfile(self.model_path()))
+
+    def has_class(self, wanted):
+        """目前載入的模型是否含有指定類別；避免舊怪物模型誤取代道具辨識。"""
+        if not self.available():
+            return False
+        with self.lock:
+            if not self._load():
+                return False
+            names = getattr(self.model, "names", {}) or {}
+            return str(wanted).lower() in {str(name).lower() for name in names.values()}
 
     def _load(self):
         path = self.model_path()
@@ -1009,7 +1027,7 @@ class CombatScanner(threading.Thread):
         return bool(self.scan_ready() and self.tag_template is not None)
 
     def loot_ready(self):
-        return bool(self.item_templates and self.tag_template is not None)
+        return bool(self.tag_template is not None and (self.item_templates or self.yolo.has_class("item")))
 
     def reload(self):
         self.mon_templates = load_monster_templates()
@@ -1045,7 +1063,7 @@ class CombatScanner(threading.Thread):
                             mons.append(target)
                 else:
                     self.motion_gray = None
-                items = analyze_items(img, self.app.cfg["loot"], cb, self.item_templates) if want_loot else []
+                items = analyze_items(img, self.app.cfg["loot"], cb, self.item_templates, self.yolo) if want_loot else []
                 self.snap = (time.time(), char, mons, items)
                 self.ms = (time.time() - t0) * 1000
             except Exception as e:
@@ -5432,7 +5450,7 @@ class App:
         cb = self.cfg["combat"]
         t0 = time.time()
         char, mons = analyze_combat(img, cb, self.scanner.mon_templates, self.scanner.tag_template)
-        items = analyze_items(img, self.cfg["loot"], cb, self.scanner.item_templates)
+        items = analyze_items(img, self.cfg["loot"], cb, self.scanner.item_templates, self.scanner.yolo)
         ms = (time.time() - t0) * 1000
         out = img.copy()
         if char:

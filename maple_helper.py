@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.0"
+APP_VERSION = "v4.1.1"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -75,6 +75,7 @@ DEFAULT_CONFIG = {
     "keys": {"jump": "alt", "attack": "ctrl", "left": "left", "right": "right",
              "up": "up", "down": "down"},
     "attack": {"enabled": False, "interval": 0.6},
+    "buff_start_wait": 1.0,   # 開始時放完全部 Buff 後，再等幾秒才開始移動（等最後一個 Buff 動作結束）
     "skills": [
         {"name": "Buff 範例", "key": "home", "interval": 180, "enabled": False, "delay": 0.8},
     ],
@@ -105,6 +106,8 @@ DEFAULT_CONFIG = {
         "imgsz": 960,
         # 路線爬繩時，先用畫面上的 YOLO 繩子框做最後對位；沒有結果會自動退回原本的小地圖／微調流程。
         "rope_assist": True,
+        # 各類別信心門檻（低於門檻的框不採用）；道具與繩子的信心通常比怪物、人物低
+        "class_conf": {"monster": 0.45, "item": 0.35, "rope": 0.25, "player": 0.45},
     },
     "lie_detector": {"enabled": True, "threshold": 0.8, "beep": True},
     "elite": {
@@ -190,6 +193,7 @@ YOLO_LABELS_DIR = os.path.join(YOLO_DATA_DIR, "labels")
 YOLO_CLASS_NAMES = ("monster", "item", "rope", "player")
 YOLO_CLASS_LABELS = ("怪物", "道具", "繩子", "人物")
 YOLO_CLASS_COLORS = ("#00ff66", "#ff4fd8", "#ffb000", "#00d9ff")
+YOLO_CLASS_CONF_DEFAULT = {"monster": 0.45, "item": 0.35, "rope": 0.25, "player": 0.45}
 
 
 def imread_unicode(path):
@@ -679,6 +683,11 @@ def client_rect(hwnd):
     return pt.x, pt.y, r.right - r.left, r.bottom - r.top
 
 
+def rect_visible(rect):
+    """遊戲視窗縮到最小時，Windows 會回報 (-32000, -32000, 0, 0)；這時不能截圖"""
+    return bool(rect) and rect[2] > 0 and rect[3] > 0 and rect[0] > -30000 and rect[1] > -30000
+
+
 def activate_window(hwnd):
     """把遊戲視窗切到前景（本工具是前景程式時，Windows 允許這麼做）"""
     if not (IS_WIN and hwnd):
@@ -995,6 +1004,28 @@ def analyze_items(img_bgr, loot, cb, item_tpls, yolo=None):
             for cx, cy, v, n in find_all(gray, scaled, float(loot.get("threshold", 0.75)), max_hits=60)]
 
 
+def yolo_preview_image(img, boxes):
+    """在畫面上用四種顏色畫出 YOLO 框（怪物綠、道具粉、繩子橘、人物藍），左上角加圖例"""
+    out = img.copy()
+    bgr = {}
+    for k, hexc in zip(YOLO_CLASS_NAMES, YOLO_CLASS_COLORS):
+        r, g, b = int(hexc[1:3], 16), int(hexc[3:5], 16), int(hexc[5:7], 16)
+        bgr[k] = (b, g, r)
+    for x1, y1, x2, y2, conf, name in boxes:
+        color = bgr.get(name, (255, 255, 255))
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(out, f"{name} {conf:.2f}", (x1, max(12, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1,
+                    cv2.LINE_AA)
+    y = 18
+    for k in YOLO_CLASS_NAMES:
+        n = sum(1 for b in boxes if b[5] == k)
+        cv2.rectangle(out, (6, y - 11), (18, y + 1), bgr[k], -1)
+        cv2.putText(out, f"{k}: {n}", (24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(out, f"{k}: {n}", (24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr[k], 1, cv2.LINE_AA)
+        y += 18
+    return out
+
+
 class YoloMonsterDetector:
     """可選的 YOLO 怪物偵測器。延後載入，沒裝套件／沒有模型時不影響既有功能。"""
 
@@ -1081,8 +1112,26 @@ class YoloMonsterDetector:
             log(self.error, "error")
             return False
 
+    def class_conf(self):
+        cfg = self.app.cfg.get("yolo", {})
+        out = dict(YOLO_CLASS_CONF_DEFAULT)
+        for k, v in (cfg.get("class_conf") or {}).items():
+            try:
+                out[str(k).lower()] = float(v)
+            except (TypeError, ValueError):
+                pass
+        return out
+
     def detect_classes(self, img_bgr, wanted=None):
-        """成功時回傳指定類別（或全部）的 YOLO 結果；模型未可用時回傳 None。"""
+        """成功時回傳指定類別（或全部）的 YOLO 結果 [(x, y, 信心, "YOLO_類別")]；模型未可用時回傳 None。"""
+        boxes = self.detect_boxes(img_bgr, wanted)
+        if boxes is None:
+            return None
+        return [(int(round((x1 + x2) / 2)), int(round((y1 + y2) / 2)), conf, "YOLO_" + name)
+                for x1, y1, x2, y2, conf, name in boxes]
+
+    def detect_boxes(self, img_bgr, wanted=None):
+        """回傳 [(x1, y1, x2, y2, 信心, 類別)]，每個類別套用自己的信心門檻。"""
         if not self.available():
             return None
         with self.lock:
@@ -1090,7 +1139,9 @@ class YoloMonsterDetector:
                 return None
             cfg = self.app.cfg.get("yolo", {})
             try:
-                kw = dict(conf=float(cfg.get("confidence", 0.45)), imgsz=int(cfg.get("imgsz", 960)), verbose=False)
+                th = self.class_conf()
+                low = min(th.values()) if wanted is None else th.get(wanted, float(cfg.get("confidence", 0.45)))
+                kw = dict(conf=max(0.05, low), imgsz=int(cfg.get("imgsz", 960)), verbose=False)
                 try:
                     result = self.model.predict(img_bgr, device=self.device if self.device is not None else "cpu",
                                                 **kw)[0]
@@ -1107,13 +1158,17 @@ class YoloMonsterDetector:
                 return None
         out = []
         names = result.names or {}
+        th = self.class_conf()
+        fallback = float(cfg.get("confidence", 0.45))
         for xyxy, conf, class_id in zip(result.boxes.xyxy.cpu().tolist(), result.boxes.conf.cpu().tolist(),
                                         result.boxes.cls.cpu().tolist()):
             name = str(names.get(int(class_id), class_id)).lower()
             if wanted is not None and name != wanted:
                 continue
+            if conf < th.get(name, fallback):
+                continue
             x1, y1, x2, y2 = xyxy
-            out.append((int(round((x1 + x2) / 2)), int(round((y1 + y2) / 2)), float(conf), "YOLO_" + name))
+            out.append((int(x1), int(y1), int(x2), int(y2), float(conf), name))
         return out
 
     def detect(self, img_bgr):
@@ -1399,7 +1454,13 @@ class Vision(threading.Thread):
                             self.pos, self.minimap, self.rect = None, None, None
                         time.sleep(0.3)
                         continue
-                self.rect = client_rect(self.hwnd)
+                rect = client_rect(self.hwnd)
+                if not rect_visible(rect):               # 遊戲縮到最小：先不辨識，等視窗還原
+                    with self.lock:
+                        self.pos, self.minimap, self.rect = None, None, None
+                    time.sleep(0.3)
+                    continue
+                self.rect = rect
                 mm = cfg.get("minimap")
                 if mm and sct:
                     L, T, _, _ = self.rect
@@ -1433,6 +1494,8 @@ class Vision(threading.Thread):
         if not self.hwnd:
             return None
         L, T, W, H = client_rect(self.hwnd)
+        if not rect_visible((L, T, W, H)):
+            return None
         with mss.mss() as s:
             shot = s.grab({"left": L, "top": T, "width": W, "height": H})
         return np.ascontiguousarray(np.array(shot)[:, :, :3])
@@ -1825,22 +1888,43 @@ class Bot(threading.Thread):
                 self.kb.tap(self.key("attack"))
                 self.attack_last = time.time()
 
+    def quiet_wait(self, sec):
+        """等待：只檢查暫停／前景，不放技能、不被撿物或菁英中斷（開始時放 Buff 用）"""
+        end = time.time() + sec
+        while time.time() < end:
+            self.check(allow_elite=False)
+            time.sleep(min(0.03, max(0, end - time.time())))
+
     def cast_startup_buffs(self):
-        """每次按開始時先完整輪流放一輪 Buff，再進入任何攻擊／移動流程。"""
+        """每次按開始時先完整輪流放一輪 Buff，全部放完、動作結束後，才進入任何攻擊／移動流程。
+
+        按開始後本工具會縮小並把遊戲切到前景（約 0.15 秒）；先等遊戲真的在前景再送鍵，
+        避免第一個 Buff 送到別的視窗。每個 Buff 之間等它的「施放後等待」，最後再等「放完 Buff 後等待」，
+        讓最後一個 Buff 的施放動作完整結束，錄製路線才從頭開始。"""
         enabled = [(i, s) for i, s in enumerate(self.cfg["skills"]) if s.get("enabled")]
         if not enabled:
             return
         # 不讓先前殘留的方向鍵、定點按住攻擊等干擾 Buff。
         self.kb.release_all()
+        self.status = "啟動 Buff：等待遊戲視窗…"
+        if IS_WIN and not self.cfg.get("only_when_focused"):
+            end = time.time() + 3.0
+            while time.time() < end and not is_foreground(self.app.vision.hwnd):
+                self.check(allow_elite=False)
+                time.sleep(0.05)
+        self.check(allow_elite=False)             # 「只在前景送鍵」開啟時，會等到遊戲在前景
+        self.quiet_wait(0.25)          # 切到遊戲後給一點時間，按鍵才不會被吃掉
         for i, s in enabled:
-            if not self.active.is_set():
-                return
+            self.check(allow_elite=False)
             self.status = f"啟動 Buff：{s['name']}"
             self.kb.tap(s["key"])
             self.skill_last[i] = time.time()
-            end = time.time() + max(0.0, float(s.get("delay", 0.6)))
-            while self.active.is_set() and time.time() < end:
-                time.sleep(0.03)
+            self.quiet_wait(max(0.0, float(s.get("delay", 0.6))))
+        wait = max(0.0, float(self.cfg.get("buff_start_wait", 1.0)))
+        if wait:
+            self.status = f"Buff 放完，{wait:g} 秒後開始"
+            self.quiet_wait(wait)
+        log(f"開始時 Buff 放完（{len(enabled)} 個），開始移動")
 
     # ---- 動作 ----
     def goto(self, tx, tol=None, timeout=10):
@@ -4100,6 +4184,9 @@ class App:
             "anchor": self.build_anchor(host),
             "buff": self.build_loot(host),
         }
+        # 繩下定點／爬繩／跳台：兩種模式共用，放在模式設定下面
+        self.pn_patrol = self.build_patrol(host)
+        self.patrol_box.config(text=" 繩下定點（爬繩／跳台） ")
 
     def set_mode(self, key):
         if key != self.cfg.get("mode"):
@@ -4126,7 +4213,18 @@ class App:
         self.lbl_mode_desc.config(text=MODE_INFO[mode][1])
         for p in self.pn.values():
             p.pack_forget()
+        self.pn_patrol.pack_forget()
         self.pn[mode].pack(fill="x")
+        self.pn_patrol.pack(fill="x")
+        if mode == "buff":
+            self.lbl_patrol_hint.config(text="站在繩子正下方按「＋ 繩下定點」記錄繩子位置；爬不穩就改用「● 錄製爬繩」親手爬一次。"
+                                             "沒有錄製全圖路線時，BUFF 機會在巡邏點與繩子之間隨機移動。")
+            if not self.btn_rec_point.winfo_manager():
+                self.btn_rec_point.pack(side="left", padx=(0, 6), before=self.btn_rec_rope)
+        else:
+            self.lbl_patrol_hint.config(text="被怪撞下去時，會用這裡記錄的繩子／跳台爬回定點。站在繩子正下方按「＋ 繩下定點」；"
+                                             "爬不穩就用「● 錄製爬繩」親手爬一次；跳上浮空平台用「● 錄製跳台」。往下會自動下跳。")
+            self.btn_rec_point.pack_forget()
         legend = "黃十字＝角色　灰虛圈＝已忽略的同色圖示　紅圈＝其他玩家"
         legend += "　青框＝定點"
         if mode == "buff":
@@ -4170,14 +4268,6 @@ class App:
                         variable=self.var_anchor_rep, command=self.save_anchor).pack(anchor="w")
         ttk.Checkbutton(adv.body, text="放 Buff 時先放開，放完再按回去",
                         variable=self.var_anchor_buff, command=self.save_anchor).pack(anchor="w")
-        ropes = Collapsible(f, "爬繩／跳台（被怪撞下去時，用這些路線爬回定點）",
-                            opened=bool(self.cfg.get("patrol")))
-        ropes.pack(fill="x", pady=(0, 8))
-        self.build_patrol(ropes.body).pack(fill="x")
-        self.btn_rec_point.pack_forget()
-        self.patrol_box.config(text=" 爬繩／跳台 ")
-        self.lbl_patrol_hint.config(text="站在繩子正下方按「錄製爬繩」，自己爬上去後按錄製結束熱鍵；"
-                                         "跳上浮空平台用「錄製跳台」。往下會自動下跳，不用記。")
         self.update_anchor_label()
         return f
 
@@ -4306,16 +4396,18 @@ class App:
         self.tv_patrol.pack(fill="x")
         r = ttk.Frame(self.patrol_box)
         r.pack(fill="x", pady=(4, 0))
-        self.btn_rec_point = ttk.Button(r, text="＋ 記錄攻擊點", command=lambda: self.record_patrol("point"))
+        self.btn_rec_point = ttk.Button(r, text="＋ 巡邏點", command=lambda: self.record_patrol("point"))
         self.btn_rec_point.pack(side="left", padx=(0, 6))
-        self.btn_rec_rope = ttk.Button(r, text="＋ 記錄繩子（站在繩下）", command=lambda: self.record_patrol("rope"))
+        self.btn_rec_rope = ttk.Button(r, text="＋ 繩下定點", command=lambda: self.record_patrol("rope"))
         self.btn_rec_rope.pack(side="left", padx=(0, 6))
         ttk.Button(r, text="● 錄製爬繩", command=self.record_rope_macro).pack(side="left", padx=(0, 6))
-        ttk.Button(r, text="● 錄製跳台", command=self.record_jump_macro).pack(side="left", padx=(0, 6))
-        ttk.Button(r, text="校準精準位置", command=self.calibrate_rope).pack(side="left", padx=(0, 6))
-        ttk.Button(r, text="繩子設定", command=self.edit_patrol_rope).pack(side="left", padx=(0, 6))
-        ttk.Button(r, text="刪除", command=self.del_patrol).pack(side="left", padx=(0, 6))
-        ttk.Button(r, text="清空", command=self.clear_patrol).pack(side="left")
+        ttk.Button(r, text="● 錄製跳台", command=self.record_jump_macro).pack(side="left")
+        r2 = ttk.Frame(self.patrol_box)
+        r2.pack(fill="x", pady=(4, 0))
+        ttk.Button(r2, text="校準精準位置", command=self.calibrate_rope).pack(side="left", padx=(0, 6))
+        ttk.Button(r2, text="繩子設定", command=self.edit_patrol_rope).pack(side="left", padx=(0, 6))
+        ttk.Button(r2, text="刪除", command=self.del_patrol).pack(side="left", padx=(0, 6))
+        ttk.Button(r2, text="清空", command=self.clear_patrol).pack(side="left")
         adv = Collapsible(self.patrol_box, "進階：停留時間、位置偏移、繩子落點")
         adv.pack(fill="x", pady=(4, 0))
         self.patrol_vars = getattr(self, "patrol_vars", {})
@@ -4421,19 +4513,26 @@ class App:
         yc = self.cfg.get("yolo", {})
         self.var_yolo_enabled = tk.BooleanVar(value=yc.get("enabled", True))
         self.var_yolo_rope_assist = tk.BooleanVar(value=yc.get("rope_assist", True))
-        self.var_yolo_conf = tk.StringVar(value=str(yc.get("confidence", 0.45)))
+        cc = dict(YOLO_CLASS_CONF_DEFAULT, **(yc.get("class_conf") or {}))
+        self.var_yolo_class_conf = {k: tk.StringVar(value=f"{float(cc[k]):g}") for k in YOLO_CLASS_NAMES}
         row2 = ttk.Frame(runtime)
         row2.pack(fill="x")
         ttk.Checkbutton(row2, text="啟用此地圖 YOLO 模型", variable=self.var_yolo_enabled,
                         command=self.save_yolo_runtime).pack(side="left")
         ttk.Checkbutton(row2, text="爬繩時畫面對位", variable=self.var_yolo_rope_assist,
                         command=self.save_yolo_runtime).pack(side="left", padx=(10, 0))
-        ttk.Label(row2, text="信心門檻").pack(side="left", padx=(14, 5))
-        entry_conf = ttk.Entry(row2, textvariable=self.var_yolo_conf, width=6)
-        entry_conf.pack(side="left")
-        entry_conf.bind("<FocusOut>", lambda _: self.save_yolo_runtime())
-        entry_conf.bind("<Return>", lambda _: self.save_yolo_runtime())
         ttk.Button(row2, text="測試目前畫面", command=self.preview_yolo).pack(side="left", padx=(10, 0))
+        row3 = ttk.Frame(runtime)
+        row3.pack(fill="x", pady=(4, 0))
+        ttk.Label(row3, text="信心門檻").pack(side="left", padx=(0, 6))
+        for k, label in zip(YOLO_CLASS_NAMES, YOLO_CLASS_LABELS):
+            ttk.Label(row3, text=label).pack(side="left", padx=(6, 2))
+            e = ttk.Entry(row3, textvariable=self.var_yolo_class_conf[k], width=5)
+            e.pack(side="left")
+            e.bind("<FocusOut>", lambda _: self.save_yolo_runtime())
+            e.bind("<Return>", lambda _: self.save_yolo_runtime())
+        hint(runtime, "道具、繩子比較小或比較細，模型的信心本來就比較低；看不到時先調低它們的門檻（例如 0.2），"
+                      "誤判太多再調高。", pady=(3, 0))
         self.lbl_yolo_model = ttk.Label(runtime, text="", style="Hint.TLabel")
         self.lbl_yolo_model.pack(anchor="w", pady=(4, 0))
 
@@ -4458,8 +4557,8 @@ class App:
 
     def save_yolo_runtime(self):
         try:
-            confidence = float(self.var_yolo_conf.get())
-            if not 0.05 <= confidence <= 0.95:
+            class_conf = {k: float(v.get()) for k, v in self.var_yolo_class_conf.items()}
+            if not all(0.05 <= v <= 0.95 for v in class_conf.values()):
                 raise ValueError
         except ValueError:
             self.notify("YOLO 信心門檻請填 0.05～0.95", error=True)
@@ -4467,7 +4566,8 @@ class App:
         yc = self.cfg.setdefault("yolo", {})
         yc["enabled"] = self.var_yolo_enabled.get()
         yc["rope_assist"] = self.var_yolo_rope_assist.get()
-        yc["confidence"] = confidence
+        yc["class_conf"] = class_conf
+        yc["confidence"] = class_conf["monster"]
         yc.setdefault("model", "yolo_data/models/monster_current_map_v2.pt")
         yc.setdefault("imgsz", 960)
         self.scanner.yolo.invalidate()
@@ -4629,19 +4729,26 @@ class App:
         if not self.save_yolo_runtime():
             return
         t0 = time.time()
-        monsters = self.scanner.yolo.detect_classes(img)
+        boxes = self.scanner.yolo.detect_boxes(img)
         elapsed = (time.time() - t0) * 1000
         self.update_yolo_model_label()
-        if monsters is None:
+        if boxes is None:
             self.notify(self.scanner.yolo.error or "YOLO 模型目前無法使用。", error=True)
             return
-        out = img.copy()
-        for x, y, score, name in monsters:
-            cv2.circle(out, (x, y), 18, (255, 80, 0), 2)
-            cv2.putText(out, f"{name[5:]} {score:.2f}", (x - 36, y - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                        (255, 80, 0), 2, cv2.LINE_AA)
+        out = yolo_preview_image(img, boxes)
+        model_names = self.scanner.yolo.class_names.get(self.scanner.yolo.model_path(), set())
+        counts = {k: sum(1 for b in boxes if b[5] == k) for k in YOLO_CLASS_NAMES}
+        th = self.scanner.yolo.class_conf()
+        parts = []
+        for k, label in zip(YOLO_CLASS_NAMES, YOLO_CLASS_LABELS):
+            if model_names and k not in model_names:
+                parts.append(f"{label}：模型沒有這個類別")
+            else:
+                parts.append(f"{label} {counts[k]}" + ("" if counts[k] else f"（門檻 {th[k]:g}）"))
+        summary = "、".join(parts)
+        log(f"YOLO 測試：{summary}，{elapsed:.0f} ms")
         win = tk.Toplevel(self.root)
-        win.title(f"YOLO 偵測：{len(monsters)} 隻怪物（{elapsed:.0f} ms）")
+        win.title(f"YOLO 偵測：{summary}（{elapsed:.0f} ms）")
         win.attributes("-topmost", True)
         scale = min(1.0, (self.root.winfo_screenwidth() - 80) / out.shape[1],
                     (self.root.winfo_screenheight() - 120) / out.shape[0])
@@ -4654,6 +4761,15 @@ class App:
         self.skill_grid = ttk.Frame(box)
         self.skill_grid.pack(fill="x")
         button_row(box, [("＋ 新增技能", self.add_skill)])
+        wait_row = ttk.Frame(box)
+        wait_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(wait_row, text="開始時放完 Buff 後再等").pack(side="left")
+        self.var_buff_wait = tk.StringVar(value=f"{float(self.cfg.get('buff_start_wait', 1.0)):g}")
+        ew = ttk.Entry(wait_row, textvariable=self.var_buff_wait, width=5)
+        ew.pack(side="left", padx=4)
+        ttk.Label(wait_row, text="秒才開始移動").pack(side="left")
+        ew.bind("<FocusOut>", lambda _e: self.save_buff_wait())
+        ew.bind("<Return>", lambda _e: self.save_buff_wait())
         box2 = section(f, "持續攻擊", "路線的「等待」步驟中，依間隔一直按攻擊鍵。")
         r = ttk.Frame(box2)
         r.pack(fill="x")
@@ -5266,6 +5382,18 @@ class App:
             self.skill_rows.append((on, name, key, itv, dly))
         if not self.cfg["skills"]:
             ttk.Label(g, text="尚未新增技能", style="Hint.TLabel").grid(row=1, column=0, columnspan=6, sticky="w")
+
+    def save_buff_wait(self):
+        try:
+            v = float(self.var_buff_wait.get())
+            if not 0 <= v <= 30:
+                raise ValueError
+        except ValueError:
+            self.notify("放完 Buff 後等待請填 0～30 秒", error=True)
+            return
+        if v != self.cfg.get("buff_start_wait"):
+            self.cfg["buff_start_wait"] = v
+            save_config(self.cfg)
 
     def save_skill_row(self, i):
         if i >= len(self.cfg["skills"]) or i >= len(self.skill_rows):

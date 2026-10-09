@@ -210,6 +210,7 @@ config.json
 maps/
 templates/
 diag/
+logs/
 maple_helper_備份_改版前.py
 
 # Ruff stuff:

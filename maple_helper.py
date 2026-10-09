@@ -19,9 +19,12 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections import deque
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import hashlib
+import traceback
 import urllib.error
 import urllib.request
 import zipfile
@@ -47,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.0.3"
+APP_VERSION = "v4.1.0"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -264,12 +267,12 @@ def load_config():
             backup = os.path.join(APP_DIR, f"config.corrupt-{stamp}.json")
             try:
                 os.replace(CONFIG_PATH, backup)
-                print(f"設定檔格式錯誤，已備份至：{backup}")
+                log(f"設定檔格式錯誤，已備份至：{backup}", "error")
             except OSError as backup_error:
-                print("設定檔格式錯誤，但備份失敗：", backup_error)
-            print("讀取設定失敗（改用預設值）：", e)
+                log(f"設定檔格式錯誤，但備份失敗：{backup_error}", "error")
+            log(f"讀取設定失敗（改用預設值）：{e}", "error")
         except OSError as e:
-            print("讀取設定失敗（改用預設值）：", e)
+            log(f"讀取設定失敗（改用預設值）：{e}", "error")
     # v3.8 起主畫面只保留定點掛機與 BUFF 機；舊模式安全回到定點掛機。
     if cfg.get("mode") not in ("anchor", "buff"):
         cfg["mode"] = "anchor"
@@ -318,6 +321,78 @@ def migrate_config(cfg):
 
 
 _SAVE_LOCK = threading.Lock()
+LOG_DIR = os.path.join(APP_DIR, "logs")
+LOG_KEEP_DAYS = 14
+
+
+class EventLog:
+    """全程式共用的日誌：寫到 logs/日期.log，並通知介面（任何執行緒都可呼叫）"""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.recent = deque(maxlen=600)
+        self.listeners = []
+        self._cleaned = False
+
+    @staticmethod
+    def stamp(t=None):
+        lt = time.localtime(t)
+        return f"[{lt.tm_year}/{lt.tm_mon}/{lt.tm_mday} {time.strftime('%H:%M:%S', lt)}]"
+
+    def _cleanup(self):
+        self._cleaned = True
+        try:
+            cutoff = time.time() - LOG_KEEP_DAYS * 86400
+            for name in os.listdir(LOG_DIR):
+                path = os.path.join(LOG_DIR, name)
+                if name.endswith(".log") and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+        except OSError:
+            pass
+
+    def write(self, msg, level="info"):
+        msg = str(msg).replace("\r", "").strip()
+        if not msg:
+            return
+        line = f"{self.stamp()} {msg}"
+        with self.lock:
+            self.recent.append((line, level))
+            try:
+                os.makedirs(LOG_DIR, exist_ok=True)
+                if not self._cleaned:
+                    self._cleanup()
+                tag = {"error": "錯誤", "warn": "注意"}.get(level)
+                with open(os.path.join(LOG_DIR, time.strftime("%Y-%m-%d") + ".log"), "a", encoding="utf-8") as f:
+                    f.write((line if not tag else f"{line} 〔{tag}〕") + "\n")
+            except OSError:
+                pass
+            listeners = list(self.listeners)
+        for fn in listeners:
+            try:
+                fn(line, level)
+            except Exception:
+                pass
+
+
+EVENT_LOG = EventLog()
+
+
+def log(msg, level="info"):
+    EVENT_LOG.write(msg, level)
+
+
+def log_exception(prefix, exc=None):
+    """記錄錯誤訊息＋完整追蹤（追蹤只寫進檔案的下一行，畫面只顯示一行）"""
+    detail = traceback.format_exc() if exc is not None else ""
+    log(f"{prefix}：{exc}" if exc is not None else prefix, "error")
+    if detail and "NoneType: None" not in detail:
+        try:
+            with EVENT_LOG.lock:
+                os.makedirs(LOG_DIR, exist_ok=True)
+                with open(os.path.join(LOG_DIR, time.strftime("%Y-%m-%d") + ".log"), "a", encoding="utf-8") as f:
+                    f.write("".join("    " + ln + "\n" for ln in detail.rstrip().splitlines()))
+        except OSError:
+            pass
 
 
 def save_config(cfg):
@@ -929,6 +1004,9 @@ class YoloMonsterDetector:
         self.loaded_path = None
         self.error = None
         self.lock = threading.Lock()
+        self.class_names = {}      # 模型路徑 -> 類別名稱集合（避免介面每 0.1 秒去搶模型鎖）
+        self.device = None
+        self._bg_loading = False
 
     def model_path(self):
         raw = str(self.app.cfg.get("yolo", {}).get("model", "")).strip()
@@ -939,20 +1017,38 @@ class YoloMonsterDetector:
             self.model = None
             self.loaded_path = None
             self.error = None
+            self.class_names = {}
+            self.device = None
 
     def available(self):
         cfg = self.app.cfg.get("yolo", {})
         return bool(cfg.get("enabled") and os.path.isfile(self.model_path()))
 
     def has_class(self, wanted):
-        """目前載入的模型是否含有指定類別；避免舊怪物模型誤取代道具辨識。"""
+        """目前載入的模型是否含有指定類別；避免舊怪物模型誤取代道具辨識。
+        類別清單會快取；主執行緒（介面）呼叫時不等待模型載入，改在背景載入。"""
         if not self.available():
             return False
-        with self.lock:
-            if not self._load():
+        path = self.model_path()
+        names = self.class_names.get(path)
+        if names is None:
+            if threading.current_thread() is threading.main_thread():
+                if not self._bg_loading and not self.error:
+                    self._bg_loading = True
+
+                    def bg():
+                        try:
+                            with self.lock:
+                                self._load()
+                        finally:
+                            self._bg_loading = False
+                    threading.Thread(target=bg, daemon=True).start()
                 return False
-            names = getattr(self.model, "names", {}) or {}
-            return str(wanted).lower() in {str(name).lower() for name in names.values()}
+            with self.lock:
+                if not self._load():
+                    return False
+            names = self.class_names.get(path, set())
+        return str(wanted).lower() in names
 
     def _load(self):
         path = self.model_path()
@@ -966,10 +1062,23 @@ class YoloMonsterDetector:
             self.model = YOLO(path)
             self.loaded_path = path
             self.error = None
+            names = getattr(self.model, "names", {}) or {}
+            self.class_names[path] = {str(n).lower() for n in names.values()}
+            want = str(self.app.cfg.get("yolo", {}).get("device", "auto")).lower()
+            if want in ("", "auto"):
+                try:
+                    import torch
+                    self.device = 0 if torch.cuda.is_available() else "cpu"
+                except Exception:
+                    self.device = "cpu"
+            else:
+                self.device = int(want) if want.isdigit() else want
+            log(f"YOLO 模型已載入（{os.path.basename(path)}，{'GPU' if self.device == 0 else 'CPU'}）")
             return True
         except Exception as e:
             self.model = None
             self.error = f"YOLO 無法載入：{e}"
+            log(self.error, "error")
             return False
 
     def detect_classes(self, img_bgr, wanted=None):
@@ -981,10 +1090,19 @@ class YoloMonsterDetector:
                 return None
             cfg = self.app.cfg.get("yolo", {})
             try:
-                result = self.model.predict(img_bgr, conf=float(cfg.get("confidence", 0.45)),
-                                            imgsz=int(cfg.get("imgsz", 960)), device=0,
-                                            verbose=False)[0]
+                kw = dict(conf=float(cfg.get("confidence", 0.45)), imgsz=int(cfg.get("imgsz", 960)), verbose=False)
+                try:
+                    result = self.model.predict(img_bgr, device=self.device if self.device is not None else "cpu",
+                                                **kw)[0]
+                except Exception:
+                    if self.device == "cpu":
+                        raise
+                    self.device = "cpu"   # GPU 不能用（沒有 CUDA、顯示卡記憶體不足…）→ 改用 CPU 再試一次
+                    log("YOLO 改用 CPU 偵測（GPU 無法使用）", "warn")
+                    result = self.model.predict(img_bgr, device="cpu", **kw)[0]
             except Exception as e:
+                if self.error != f"YOLO 偵測失敗：{e}":
+                    log(f"YOLO 偵測失敗：{e}", "error")
                 self.error = f"YOLO 偵測失敗：{e}"
                 return None
         out = []
@@ -1069,7 +1187,9 @@ class CombatScanner(threading.Thread):
                 self.snap = (time.time(), char, mons, items)
                 self.ms = (time.time() - t0) * 1000
             except Exception as e:
-                print("Combat scan error:", e)
+                if time.time() - getattr(self, "_err_logged", 0) > 30:
+                    self._err_logged = time.time()
+                    log_exception("畫面掃描錯誤", e)
                 time.sleep(0.5)
             time.sleep(float(cb.get("scan_interval", 0.2)))
 
@@ -1180,7 +1300,9 @@ class DiagRecorder(threading.Thread):
                 if self.session is not None:
                     self._frame(self.session)
             except Exception as e:
-                print("診斷記錄錯誤：", e)
+                if time.time() - getattr(self, "_err_logged", 0) > 30:
+                    self._err_logged = time.time()
+                    log_exception("診斷記錄錯誤", e)
             time.sleep(0.25)
         self._close()
 
@@ -1295,7 +1417,9 @@ class Vision(threading.Thread):
                 if time.time() - t0 >= 1:
                     self.fps, frames, t0 = frames / (time.time() - t0), 0, time.time()
             except Exception as e:
-                print("Vision error:", e)
+                if time.time() - getattr(self, "_err_logged", 0) > 30:
+                    self._err_logged = time.time()
+                    log_exception("畫面辨識錯誤", e)
                 self.hwnd = None
                 time.sleep(0.5)
             time.sleep(0.03)
@@ -1333,6 +1457,15 @@ class KeyRecorder(threading.Thread):
         self.start_img = None
 
     def run(self):
+        try:
+            self._run()
+        except Exception as e:
+            self.active = False
+            self.cancelled = True
+            log_exception("錄製發生錯誤，已取消", e)
+            self.app.ui(lambda: self.on_done(None, True))
+
+    def _run(self):
         hk = self.app.cfg.get("hotkeys", {})
         stop_vk = VK_FKEYS.get(hk.get("record", "f8"), 0x77)       # 結束錄製
         cancel_vk = VK_FKEYS.get(hk.get("stop", "f12"), 0x7B)      # 取消錄製
@@ -1373,6 +1506,8 @@ class KeyRecorder(threading.Thread):
             return True
 
         def mouse_pos():
+            if not IS_WIN:
+                return None
             pt = wintypes.POINT()
             user32.GetCursorPos(ctypes.byref(pt))
             rect = self.app.vision.rect
@@ -2982,6 +3117,7 @@ class Bot(threading.Thread):
             except Exception as e:
                 self.kb.release_all()
                 self.status = f"錯誤：{e}"
+                log_exception("自動執行發生錯誤，已暫停", e)
                 self.active.clear()
 
 
@@ -3223,7 +3359,7 @@ def make_choice(parent, var, spec, width=12, on_change=None):
     return cb
 
 
-def form_grid(parent, items, src, store, on_save, width=8, cols=2, key_prefix=None):
+def form_grid(parent, items, src, store, on_save, width=8, cols=2, key_prefix=None, label_min=150, choice_min=12):
     """建立「標籤＋輸入框／下拉選單」表格。items=[(key, label) 或 (key, label, 選單設定)]；改完自動儲存"""
     for i, item in enumerate(items):
         k, label = item[0], item[1]
@@ -3232,16 +3368,16 @@ def form_grid(parent, items, src, store, on_save, width=8, cols=2, key_prefix=No
         ttk.Label(parent, text=label).grid(row=r, column=c * 2, sticky="w", padx=(0 if c == 0 else 16, 6), pady=2)
         v = tk.StringVar(value="" if src.get(k) is None else str(src.get(k)))
         if spec:
-            e = make_choice(parent, v, spec, width=max(width, 12), on_change=on_save)
+            e = make_choice(parent, v, spec, width=max(width, choice_min), on_change=on_save)
         else:
             e = ttk.Entry(parent, textvariable=v, width=width)
             e.bind("<FocusOut>", lambda _e: on_save())
             e.bind("<Return>", lambda _e: on_save())
         e.grid(row=r, column=c * 2 + 1, sticky="w", pady=2)
         store[(key_prefix, k) if key_prefix is not None else k] = v
-    parent.columnconfigure(0, minsize=px(150))
+    parent.columnconfigure(0, minsize=px(label_min))
     if cols > 1:
-        parent.columnconfigure(2, minsize=px(130))
+        parent.columnconfigure(2, minsize=px(min(130, label_min)))
     return parent
 
 
@@ -3282,12 +3418,11 @@ class App:
         root.title(f"楓之谷輔助工具 {APP_VERSION}")
         init_ui_metrics(root)
         wl, wt, ww, wh = work_area(root)
-        # 預設改為緊湊尺寸；仍可自由拉大。
-        w = min(px(640), ww - 20)
-        h = min(px(760), wh - 40)
-        # 預設放在螢幕右側，避免蓋住遊戲左上角的小地圖
+        # 左邊設定分頁＋右邊配置／日誌，預設放在螢幕右側，避免蓋住遊戲左上角的小地圖
+        w = min(px(1020), ww - 20)
+        h = min(px(700), wh - 40)
         root.geometry(f"{w}x{h}+{wl + max(0, ww - w - 20)}+{wt + 10}")
-        root.minsize(min(px(460), ww - 20), min(px(440), wh - 40))
+        root.minsize(min(px(720), ww - 20), min(px(480), wh - 40))
         root.attributes("-topmost", self.cfg.get("topmost", True))
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._base_tk_scaling = float(root.tk.call("tk", "scaling"))
@@ -3301,24 +3436,53 @@ class App:
         self._ui_queue = queue.Queue()   # 背景執行緒要更新介面時，放進這裡由主執行緒執行
         self._note_job = None
         self._tick = 0
+        self._status_norm = None
+        self._status_logged = {}
+        self.alive_ui = False
         self.vision = Vision(self)
         self.bot = Bot(self)
         self.scanner = CombatScanner(self)
 
-        self.build_header(root)
-        self.nb = ttk.Notebook(root)
-        self.nb.pack(fill="both", expand=True, padx=8, pady=(0, 4))
-        self.tab_home = ttk.Frame(self.nb, padding=(10, 8))
-        self.tab_shared = ttk.Frame(self.nb, padding=(6, 6))
-        self.tab_setup = ttk.Frame(self.nb, padding=(10, 8))
-        self.nb.add(self.tab_home, text="  主控台  ")
-        self.nb.add(self.tab_shared, text="  共用設定  ")
-        self.nb.add(self.tab_setup, text="  首次設定  ")
-        self.build_footer(root)
-
-        self.build_home(self.tab_home)
-        self.build_shared(self.tab_shared)
-        self.build_wizard(self.tab_setup)
+        self.build_banners(root)
+        body = ttk.Panedwindow(root, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=px(6), pady=(0, px(6)))
+        self.body_pane = body
+        left = ttk.Frame(body)
+        right = ttk.Frame(body, padding=(px(6), 0, 0, 0))
+        body.add(left, weight=1)
+        body.add(right, weight=0)
+        self.side_frame = right
+        self._side_compact = None
+        self._side_pref = int(self.cfg.get("side_width") or px(300))   # 使用者拖曳後的右側寬度
+        self._last_root_w = None
+        self.build_side(right)          # 先建右側（建分頁時可能就會呼叫 notify）
+        right.bind("<Configure>", self._on_side_resize, add="+")
+        body.bind("<ButtonRelease-1>", self._on_sash_drag, add="+")
+        self.nb = ttk.Notebook(left)
+        self.nb.pack(fill="both", expand=True)
+        self.nb.bind("<Configure>", self._fit_tab_titles, add="+")
+        self.tabs = {}
+        self._tab_titles = {}
+        self._tabs_short = None
+        for key, title, builder, scroll in (("settings", "設定", self.build_settings, True),
+                                            ("map", "掛機地圖", self.build_home, False),
+                                            ("alarm", "警報", self.build_alarm, True),
+                                            ("yolo", "AI 辨識", self.build_yolo_dataset, True),
+                                            ("adv", "校正", self.build_detect_adv, True),
+                                            ("setup", "首次設定", self.build_wizard, False)):
+            if scroll:
+                outer = ScrollFrame(self.nb)
+                inner = ttk.Frame(outer.inner, padding=(8, 6))
+                inner.pack(fill="both", expand=True)
+            else:
+                outer = inner = ttk.Frame(self.nb, padding=(8, 6))
+            self.nb.add(outer, text=f" {title} ")
+            self.tabs[key] = outer
+            self._tab_titles[key] = title
+            builder(inner)
+        self.tab_home = self.tabs["map"]
+        self.tab_setup = self.tabs["setup"]
+        self._autowrap_hints(self.nb)
         self.show_mode_panel()
 
         self.vision.start()
@@ -3329,6 +3493,11 @@ class App:
         self.diag.start()
         self._hotkey_state = {}
         self.alive_ui = True
+        for line, level in list(EVENT_LOG.recent):    # 介面出來之前的訊息（例如設定檔錯誤）
+            self._append_log(line, level)
+        EVENT_LOG.listeners.append(self._on_log)
+        log(f"配置加載：{APP_VERSION}，模式 {MODE_INFO.get(self.cfg.get('mode'), ('?',))[0]}"
+            + (f"，配置「{self.cfg.get('active_profile')}」" if self.cfg.get("active_profile") else ""))
         self._drain_ui()
         self.refresh()
         self.poll_hotkeys()
@@ -3363,6 +3532,9 @@ class App:
         st.configure("Link.TLabel", foreground=C_ACCENT, font=(UI_FONT, size(8), "bold"))
         st.configure("Pos.TLabel", font=(UI_FONT, size(15), "bold"))
         st.configure("Status.TLabel", foreground=C_ACCENT, font=(UI_FONT, size(9), "bold"))
+        st.configure("TNotebook.Tab", padding=(size(10), size(3)))
+        if hasattr(self, "txt_log"):
+            self.txt_log.configure(font=(UI_FONT, size(9)))
         st.configure("Big.TButton", font=(UI_FONT, size(10), "bold"), padding=(size(9), size(4)))
         st.configure("Treeview", rowheight=max(px(17), int(px(21) * ratio)))
         st.configure("Treeview.Heading", font=(UI_FONT, size(8), "bold"))
@@ -3392,70 +3564,241 @@ class App:
                     pass
             self._rescale_plain_widgets(widget, ratio)
 
+    # ---------------- 右側欄寬度、分頁名稱自動調整 ----------------
+    SIDE_MIN, SIDE_MAX, LEFT_MIN = 210, 480, 400
+    TAB_SHORT = {"settings": "設定", "map": "地圖", "alarm": "警報", "yolo": "AI", "adv": "校正", "setup": "首設"}
+
+    def _side_target(self, total):
+        """依視窗寬度決定右側欄寬：不超過使用者拖曳的寬度，窄視窗時自動收窄，左邊至少保留 LEFT_MIN"""
+        want = self._side_pref
+        if total < px(960):   # 視窗不寬時才自動收窄；夠寬就照使用者拖曳的寬度
+            want = min(want, max(px(self.SIDE_MIN), int(total * 0.34)))
+        return max(px(self.SIDE_MIN), min(want, total - px(self.LEFT_MIN)))
+
+    def _apply_side_width(self):
+        if not hasattr(self, "body_pane"):
+            return
+        total = self.body_pane.winfo_width()
+        if total < 50:
+            return
+        try:
+            self.body_pane.sashpos(0, max(px(self.LEFT_MIN), total - self._side_target(total)))
+        except tk.TclError:
+            pass
+
+    def _on_sash_drag(self, _e=None):
+        """使用者拖曳中間分隔線：記住右側寬度"""
+        try:
+            w = self.body_pane.winfo_width() - int(self.body_pane.sashpos(0))
+        except (tk.TclError, ValueError):
+            return
+        w = max(px(self.SIDE_MIN), min(px(self.SIDE_MAX), w))
+        if abs(w - self._side_pref) > 2:
+            self._side_pref = w
+            self.cfg["side_width"] = w
+            save_config(self.cfg)
+        self._apply_side_width()
+
+    def _on_side_resize(self, e):
+        """右側欄寬度改變：文字換行寬度、按鈕文字跟著調整"""
+        w = e.width
+        wrap = max(px(120), w - px(34))
+        for lb in (self.lbl_win, self.lbl_status, self.lbl_map_profile):
+            lb.config(wraplength=wrap)
+        compact = w < px(268)
+        if compact == self._side_compact:
+            return
+        self._side_compact = compact
+        for key, lb in self.chips.items():
+            full, short = self._chip_text[key]
+            lb.config(text=short if compact else full, padx=3 if compact else 5)
+        for btn, full, short in self.profile_btns:
+            btn.config(text=short if compact else full)
+        self.lbl_hover.config(style="Hint.TLabel")
+        if compact:
+            self.lbl_hover.pack_forget()
+        elif not self.lbl_hover.winfo_ismapped():
+            self.lbl_hover.pack(side="right", anchor="s")
+
+    def _autowrap_hints(self, parent):
+        """左側分頁裡的說明／狀態文字：依實際寬度自動換行，視窗變窄也不會被截斷"""
+        for w in parent.winfo_children():
+            self._autowrap_hints(w)
+            if not isinstance(w, ttk.Label) or str(w.cget("wraplength")) not in ("", "0"):
+                continue
+            if str(w.cget("style")) != "Hint.TLabel" or w.winfo_manager() != "pack":
+                continue
+            info = w.pack_info()
+            if info.get("side") in ("left", "right"):
+                w.pack_configure(fill="x", expand=True)
+            else:
+                w.pack_configure(fill="x")
+            w.configure(justify="left")
+            autowrap(w)
+
+    def _fit_tab_titles(self, _e=None):
+        """分頁列放不下時改用短名稱"""
+        try:
+            f = tkfont.Font(root=self.root, font=self._style.lookup("TNotebook.Tab", "font") or (UI_FONT, 9))
+        except tk.TclError:
+            f = tkfont.nametofont("TkDefaultFont")
+        need = sum(f.measure(f" {t} ") + px(26) for t in self._tab_titles.values())
+        short = self.nb.winfo_width() < need
+        if short == self._tabs_short:
+            return
+        self._tabs_short = short
+        for key, tab in self.tabs.items():
+            self.nb.tab(tab, text=f" {self.TAB_SHORT[key] if short else self._tab_titles[key]} ")
+
     def _on_root_resize(self, event):
         if event.widget is not self.root:
             return
+        if event.width != self._last_root_w:
+            self._last_root_w = event.width
+            self.root.after_idle(self._apply_side_width)
         # 以緊湊預設寬度為基準；拉大不放大，縮小才等比例收斂。
-        self._apply_ui_ratio(event.width / max(1, px(640)))
+        self._apply_ui_ratio(event.width / max(1, px(820)))
 
-    # ---------------- 上方狀態列 ----------------
-    def build_header(self, root):
-        hd = ttk.Frame(root, padding=(12, 10, 12, 6))
-        hd.pack(fill="x")
-        top = ttk.Frame(hd)
-        top.pack(fill="x")
-        left = ttk.Frame(top)
-        left.pack(side="left", fill="x", expand=True)
-        self.lbl_pos = ttk.Label(left, text="座標 --", style="Pos.TLabel")
-        self.lbl_pos.pack(anchor="w")
-        self.lbl_hover = ttk.Label(left, text="游標座標 --", style="Hint.TLabel")
-        self.lbl_hover.pack(anchor="w")
-        chips = ttk.Frame(left)
-        chips.pack(anchor="w", pady=(2, 0))
-        self.chips = {}
-        for key, text in (("game", "遊戲"), ("map", "小地圖"), ("dot", "角色點"), ("tag", "名牌")):
-            lb = tk.Label(chips, text="● " + text, font=(UI_FONT, 9), padx=6, pady=1, bg="#eef2f7")
-            lb.pack(side="left", padx=(0, 4))
-            self.chips[key] = lb
-        self.lbl_win = ttk.Label(chips, text="", style="Hint.TLabel")
-        self.lbl_win.pack(side="left", padx=(6, 0))
-        btns = ttk.Frame(top)
-        btns.pack(side="right")
-        # Windows 的 vista ttk 主題會強制保留大按鈕的最小高度，縮小時看起來不會跟著字變小。
-        # 這兩顆改為原生 Tk 按鈕，便可由 _rescale_plain_widgets 同步字級和內距。
-        self.btn_run = tk.Button(btns, text="▶ 開始", font=(UI_FONT, 10, "bold"), padx=9, pady=4,
-                                 relief="groove", bd=1, bg="#e8f1ff", activebackground="#d6e6ff",
-                                 command=self.toggle_run)
-        self.btn_run.pack(side="left")
-        self.btn_stop = tk.Button(btns, text="■ 停止", font=(UI_FONT, 10, "bold"), padx=9, pady=4,
-                                  relief="groove", bd=1, bg="#f4f4f5", activebackground="#e5e7eb",
-                                  command=self.stop)
-        self.btn_stop.pack(side="left", padx=(6, 0))
-        self.lbl_status = ttk.Label(hd, text="", style="Status.TLabel")
-        self.lbl_status.pack(anchor="w", pady=(6, 0))
-
-        # 尚未完成設定的提示
-        self.setup_frame = tk.Frame(hd, bg="#fff4e5")
+    # ---------------- 上方橫幅（必要設定未完成、警報） ----------------
+    def build_banners(self, root):
+        host = ttk.Frame(root, padding=(px(6), px(4), px(6), 0))
+        host.pack(fill="x")
+        self.setup_frame = tk.Frame(host, bg="#fff4e5")
         self.lbl_setup = tk.Label(self.setup_frame, text="", bg="#fff4e5", fg=C_WARN, font=(UI_FONT, 10, "bold"))
         self.lbl_setup.pack(side="left", padx=8, pady=4)
         ttk.Button(self.setup_frame, text="前往首次設定 →",
                    command=lambda: self.nb.select(self.tab_setup)).pack(side="right", padx=6, pady=3)
-        # 警報
-        self.alarm_frame = tk.Frame(hd, bg=C_BAD)
+        self.alarm_frame = tk.Frame(host, bg=C_BAD)
         self.lbl_alarm = tk.Label(self.alarm_frame, text="", bg=C_BAD, fg="white", justify="left",
-                                  wraplength=px(480), font=(UI_FONT, 11, "bold"))
+                                  wraplength=px(560), font=(UI_FONT, 11, "bold"))
         self.lbl_alarm.pack(side="left", padx=8, pady=6)
         tk.Button(self.alarm_frame, text="我處理好了", command=self.dismiss_alarm).pack(side="right", padx=8)
 
-    def build_footer(self, root):
-        ft = ttk.Frame(root, padding=(12, 0, 12, 6))
-        ft.pack(fill="x", side="bottom")
-        self.lbl_note = ttk.Label(ft, text="設定改完會自動儲存", style="Hint.TLabel")
-        self.lbl_note.pack(side="left")
+    # ---------------- 右側：狀態、配置保存、開始／停止、日誌 ----------------
+    def build_side(self, f):
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(4, weight=1)
+        st = ttk.LabelFrame(f, text=" 狀態 ", padding=(8, 4))
+        st.grid(row=0, column=0, sticky="we")
+        pos_row = ttk.Frame(st)
+        pos_row.pack(fill="x")
+        self.lbl_pos = ttk.Label(pos_row, text="座標 --", style="Pos.TLabel")
+        self.lbl_pos.pack(side="left")
+        self.lbl_hover = ttk.Label(pos_row, text="游標座標 --", style="Hint.TLabel")
+        self.lbl_hover.pack(side="right", anchor="s")
+        chips = ttk.Frame(st)
+        chips.pack(anchor="w", pady=(2, 0))
+        self.chips = {}
+        self._chip_text = {}
+        for key, text, short in (("game", "遊戲", "遊戲"), ("map", "小地圖", "地圖"), ("dot", "角色點", "角色"),
+                                 ("tag", "名牌", "名牌")):
+            self._chip_text[key] = ("● " + text, short)
+            lb = tk.Label(chips, text="● " + text, font=(UI_FONT, 9), padx=5, pady=1, bg="#eef2f7")
+            lb.pack(side="left", padx=(0, 3))
+            self.chips[key] = lb
+        self.lbl_win = ttk.Label(st, text="", style="Hint.TLabel", justify="left", wraplength=px(240))
+        self.lbl_win.pack(anchor="w", pady=(2, 0))
+        self.lbl_status = ttk.Label(st, text="", style="Status.TLabel", justify="left", wraplength=px(240))
+        self.lbl_status.pack(anchor="w", pady=(2, 0))
+
+        self.build_map_memory(f)
+
+        run = ttk.Frame(f)
+        run.grid(row=2, column=0, sticky="we", pady=(6, 0))
+        run.columnconfigure(0, weight=1, uniform="run")
+        run.columnconfigure(1, weight=1, uniform="run")
+        # Windows 的 vista ttk 主題會強制保留大按鈕的最小高度；改用原生 Tk 按鈕才能跟著縮放。
+        self.btn_run = tk.Button(run, text="▶ 開始掛機", font=(UI_FONT, 10, "bold"), padx=6, pady=5, width=1,
+                                 relief="groove", bd=1, bg="#e8f1ff", activebackground="#d6e6ff",
+                                 command=self.toggle_run)
+        self.btn_run.grid(row=0, column=0, sticky="we", padx=(0, 3))
+        self.btn_stop = tk.Button(run, text="■ 停止掛機", font=(UI_FONT, 10, "bold"), padx=6, pady=5, width=1,
+                                  relief="groove", bd=1, bg="#f4f4f5", activebackground="#e5e7eb",
+                                  command=self.stop)
+        self.btn_stop.grid(row=0, column=1, sticky="we", padx=(3, 0))
+        # 操作結果會寫進下方日誌；這一行只顯示最新一則（錯誤為紅字）
+        self.lbl_note = ttk.Label(f, text="設定改完會自動儲存", style="Hint.TLabel", anchor="w", width=1)
+        self.lbl_note.grid(row=3, column=0, sticky="we", pady=(3, 0))
+
+        lg = ttk.LabelFrame(f, text=" 日誌 ", padding=(6, 4))
+        lg.grid(row=4, column=0, sticky="nsew", pady=(6, 0))
+        bar = ttk.Frame(lg)
+        bar.pack(side="bottom", fill="x", pady=(4, 0))
+        ttk.Button(bar, text="清空", command=self.clear_log, width=6).pack(side="left")
+        ttk.Button(bar, text="開啟資料夾", command=self.open_log_dir).pack(side="left", padx=(6, 0))
+        body = ttk.Frame(lg)
+        body.pack(fill="both", expand=True)
+        self.txt_log = tk.Text(body, height=3, width=20, wrap="char", relief="flat", bd=0,
+                               bg="#fbfbfc", fg="#1f2937", font=(UI_FONT, 9), state="disabled",
+                               padx=4, pady=2, cursor="arrow")
+        sb = ttk.Scrollbar(body, orient="vertical", command=self.txt_log.yview)
+        self.txt_log.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.txt_log.pack(side="left", fill="both", expand=True)
+        self.txt_log.tag_configure("error", foreground=C_BAD)
+        self.txt_log.tag_configure("warn", foreground=C_WARN)
+        self.txt_log.tag_configure("time", foreground=C_MUTED)
+
+    # ---------------- 日誌 ----------------
+    LOG_MAX_LINES = 500
+
+    def _on_log(self, line, level):
+        """EventLog 的監聽者：任何執行緒呼叫都安全"""
+        self.ui(lambda: self._append_log(line, level))
+
+    def _append_log(self, line, level="info"):
+        if not hasattr(self, "txt_log"):
+            return
+        t = self.txt_log
+        at_end = t.yview()[1] >= 0.999
+        t.configure(state="normal")
+        stamp, _, msg = line.partition("] ")
+        t.insert("end", stamp + "] ", ("time",))
+        t.insert("end", msg + "\n", (level,) if level in ("error", "warn") else ())
+        lines = int(t.index("end-1c").split(".")[0])
+        if lines > self.LOG_MAX_LINES:
+            t.delete("1.0", f"{lines - self.LOG_MAX_LINES}.0")
+        t.configure(state="disabled")
+        if at_end:
+            t.see("end")
+
+    def clear_log(self):
+        self.txt_log.configure(state="normal")
+        self.txt_log.delete("1.0", "end")
+        self.txt_log.configure(state="disabled")
+
+    def open_log_dir(self):
+        os.makedirs(LOG_DIR, exist_ok=True)
+        if IS_WIN:
+            os.startfile(LOG_DIR)
+        else:
+            self.notify(f"日誌資料夾：{LOG_DIR}")
+
+    def _log_status(self, status):
+        """把自動執行的狀態變化寫進日誌：數字不同但內容相同的狀態視為同一種，同一種 20 秒內只記一次"""
+        if not status:
+            self._status_norm = None
+            return
+        norm = re.sub(r"[-+]?\d+(?:\.\d+)?", "#", status)
+        if norm == self._status_norm:
+            return
+        self._status_norm = norm
+        now = time.time()
+        if now - self._status_logged.get(norm, 0) < 20:
+            return
+        self._status_logged[norm] = now
+        if len(self._status_logged) > 200:
+            self._status_logged = {k: v for k, v in self._status_logged.items() if now - v < 20}
+        log(status, "error" if status.startswith("錯誤") else "info")
 
     def notify(self, msg, error=False):
-        """在視窗底部顯示訊息（取代大部分彈出視窗）"""
-        self.lbl_note.config(text=("✘ " if error else "✔ ") + msg, foreground=C_BAD if error else C_OK)
+        """在右側顯示訊息並寫入日誌（取代大部分彈出視窗）"""
+        log(msg, "error" if error else "info")
+        if not hasattr(self, "lbl_note"):
+            return
+        short = msg.replace("\n", " ")
+        short = short if len(short) <= 24 else short[:23] + "…"
+        self.lbl_note.config(text=("✘ " if error else "✔ ") + short, foreground=C_BAD if error else C_OK)
         if self._note_job:
             self.root.after_cancel(self._note_job)
         self._note_job = self.root.after(6000, lambda: self.lbl_note.config(
@@ -3463,47 +3806,75 @@ class App:
         if error:
             self.root.bell()
 
-    # ---------------- 地圖記憶 ----------------
+    # ---------------- 配置保存（每張地圖一組：小地圖框選、角色點、定點、路線…） ----------------
     def build_map_memory(self, parent):
-        box = ttk.LabelFrame(parent, text=" 地圖記憶 ", padding=(8, 5))
-        box.pack(fill="x", pady=(0, 6))
+        box = ttk.LabelFrame(parent, text=" 配置保存 ", padding=(8, 4))
+        box.grid(row=1, column=0, sticky="we", pady=(6, 0))
         row = ttk.Frame(box)
         row.pack(fill="x")
-        ttk.Label(row, text="目前地圖").pack(side="left", padx=(0, 6))
-        self.var_map_profile = tk.StringVar()
-        self.cmb_map_profile = ttk.Combobox(row, textvariable=self.var_map_profile,
-                                             state="readonly", width=24)
-        self.cmb_map_profile.pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="載入", command=self.load_map_profile).pack(side="left", padx=(6, 0))
-        ttk.Button(row, text="儲存目前", command=self.save_map_profile).pack(side="left", padx=(6, 0))
-        ttk.Button(row, text="刪除", command=self.delete_map_profile).pack(side="left", padx=(6, 0))
-        ttk.Button(row, text="↻", width=3, command=self.refresh_map_profiles).pack(side="left", padx=(6, 0))
-        self.lbl_map_profile = ttk.Label(
-            box, text="每張地圖會記住小地圖框選、角色點、路線、巡邏點、繩子與定點；技能與按鍵設定保持共用。",
-            style="Hint.TLabel")
-        self.lbl_map_profile.pack(anchor="w", pady=(3, 0))
+        ttk.Label(row, text="配置名").pack(side="left")
+        self.var_profile_name = tk.StringVar()
+        ent = ttk.Entry(row, textvariable=self.var_profile_name, width=6)
+        ent.pack(side="left", fill="x", expand=True, padx=(4, 4))
+        ent.bind("<Return>", lambda _e: self.add_map_profile())
+        ttk.Button(row, text="新增", width=5, command=self.add_map_profile).pack(side="left")
+        ttk.Button(row, text="改名", width=5, command=self.rename_map_profile).pack(side="left", padx=(3, 0))
+        lst = ttk.Frame(box)
+        lst.pack(fill="x", pady=(4, 0))
+        self.lb_profiles = tk.Listbox(lst, height=4, width=10, exportselection=False, activestyle="none",
+                                      font=(UI_FONT, 9), relief="solid", bd=1, highlightthickness=0,
+                                      selectbackground="#dbeafe", selectforeground="#111827")
+        sb = ttk.Scrollbar(lst, orient="vertical", command=self.lb_profiles.yview)
+        self.lb_profiles.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.lb_profiles.pack(side="left", fill="x", expand=True)
+        self.lb_profiles.bind("<<ListboxSelect>>", self._on_profile_pick)
+        self.lb_profiles.bind("<Double-1>", lambda _e: self.load_map_profile())
+        self.lbl_map_profile = ttk.Label(box, text="", style="Hint.TLabel", justify="left", wraplength=px(240))
+        self.lbl_map_profile.pack(fill="x", pady=(3, 0))
+        btns = ttk.Frame(box)
+        btns.pack(fill="x", pady=(3, 0))
+        self.profile_btns = []
+        for i, (text, short, cmd) in enumerate((("讀取選取配置", "讀取", self.load_map_profile),
+                                                ("保存並應用當前配置", "保存並應用", self.save_map_profile),
+                                                ("刪除", "刪除", self.delete_map_profile),
+                                                ("重載清單", "重載", self.refresh_map_profiles))):
+            b = ttk.Button(btns, text=text, command=cmd, width=1)
+            b.grid(row=i // 2, column=i % 2, sticky="we", padx=(0 if i % 2 == 0 else 3, 0), pady=1)
+            self.profile_btns.append((b, text, short))
+        btns.columnconfigure(0, weight=1, uniform="pb")
+        btns.columnconfigure(1, weight=1, uniform="pb")
         self._map_profiles = {}
         self.refresh_map_profiles()
 
+    def selected_profile(self):
+        sel = self.lb_profiles.curselection()
+        return self.lb_profiles.get(sel[0]) if sel else None
+
+    def _on_profile_pick(self, _e=None):
+        name = self.selected_profile()
+        if name:
+            self.var_profile_name.set(name)
+
     def refresh_map_profiles(self):
+        keep = self.selected_profile() or self.cfg.get("active_profile")
         self._map_profiles = {name: path for name, path in list_map_profiles()}
         names = list(self._map_profiles)
-        self.cmb_map_profile["values"] = names
-        if self.var_map_profile.get() not in self._map_profiles:
-            self.var_map_profile.set(names[0] if names else "")
+        self.lb_profiles.delete(0, "end")
+        for n in names:
+            self.lb_profiles.insert("end", n)
+        if keep in self._map_profiles:
+            i = names.index(keep)
+            self.lb_profiles.selection_set(i)
+            self.lb_profiles.see(i)
+            self.var_profile_name.set(keep)
+        active = self.cfg.get("active_profile")
+        if active and active not in self._map_profiles:
+            active = None
+        self.lbl_map_profile.config(text=(f"目前套用：{active}" if active else "目前沒有套用配置")
+                                    + f"（共 {len(names)} 組）")
 
-    def save_map_profile(self):
-        default_name = self.var_map_profile.get().strip() or "未命名地圖"
-        d = FormDialog(self.root, "儲存地圖", [("name", "地圖名稱", default_name)])
-        if not d.result:
-            return
-        name = d.result["name"].strip()
-        if not name:
-            self.notify("請輸入地圖名稱。", error=True)
-            return
-        path = map_profile_path(name)
-        if os.path.exists(path) and not messagebox.askyesno("覆寫地圖", f"「{name}」已存在，要覆寫嗎？"):
-            return
+    def _write_profile(self, name, path):
         os.makedirs(MAPS_DIR, exist_ok=True)
         profile = {"version": 1, "name": name, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                    "map": map_snapshot(self.cfg)}
@@ -3513,32 +3884,103 @@ class App:
                 json.dump(profile, f, ensure_ascii=False, indent=2)
             os.replace(tmp, path)
         except OSError as e:
-            self.notify(f"儲存地圖失敗：{e}", error=True)
+            self.notify(f"儲存配置失敗：{e}", error=True)
+            return False
+        return True
+
+    def add_map_profile(self):
+        """新增：用「配置名」把目前設定存成一組新配置"""
+        name = self.var_profile_name.get().strip()
+        if not name:
+            self.notify("請先在「配置名」輸入名稱。", error=True)
             return
+        path = map_profile_path(name)
+        if (name in self._map_profiles or os.path.exists(path)) and \
+                not messagebox.askyesno("覆寫配置", f"「{name}」已存在，要用目前設定覆寫嗎？", parent=self.root):
+            return
+        if not self._write_profile(name, path):
+            return
+        self.cfg["active_profile"] = name
+        save_config(self.cfg)
         self.refresh_map_profiles()
-        self.var_map_profile.set(name)
-        self.notify(f"已記住地圖：{name}")
+        self._select_profile(name)
+        self.notify(f"已新增配置：{name}")
+
+    def _select_profile(self, name):
+        names = list(self._map_profiles)
+        if name in names:
+            self.lb_profiles.selection_clear(0, "end")
+            self.lb_profiles.selection_set(names.index(name))
+            self.lb_profiles.see(names.index(name))
+            self.var_profile_name.set(name)
+
+    def rename_map_profile(self):
+        old = self.selected_profile()
+        new = self.var_profile_name.get().strip()
+        if not old:
+            self.notify("請先在清單選取要改名的配置。", error=True)
+            return
+        if not new or new == old:
+            self.notify("請在「配置名」輸入新的名稱。", error=True)
+            return
+        if new in self._map_profiles:
+            self.notify(f"「{new}」已存在，請換一個名稱。", error=True)
+            return
+        old_path, new_path = self._map_profiles[old], map_profile_path(new)
+        try:
+            with open(old_path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            data["name"] = new
+            with open(new_path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(new_path + ".tmp", new_path)
+            if os.path.abspath(new_path) != os.path.abspath(old_path):
+                os.remove(old_path)
+        except (OSError, ValueError) as e:
+            self.notify(f"改名失敗：{e}", error=True)
+            return
+        if self.cfg.get("active_profile") == old:
+            self.cfg["active_profile"] = new
+            save_config(self.cfg)
+        self.refresh_map_profiles()
+        self._select_profile(new)
+        self.notify(f"配置「{old}」已改名為「{new}」")
+
+    def save_map_profile(self):
+        """保存並應用：把目前設定寫進選取的配置（沒有選取就用配置名新增）"""
+        name = self.selected_profile()
+        if not name:
+            self.add_map_profile()
+            return
+        save_config(self.cfg)
+        if not self._write_profile(name, self._map_profiles.get(name) or map_profile_path(name)):
+            return
+        self.cfg["active_profile"] = name
+        save_config(self.cfg)
+        self.refresh_map_profiles()
+        self.notify(f"已保存並應用配置：{name}")
 
     def load_map_profile(self):
-        name = self.var_map_profile.get().strip()
-        path = self._map_profiles.get(name)
+        name = self.selected_profile()
+        path = self._map_profiles.get(name) if name else None
         if not path:
-            self.notify("請先選擇要載入的地圖。", error=True)
+            self.notify("請先在清單選取要讀取的配置。", error=True)
             return
         try:
             with open(path, "r", encoding="utf-8-sig") as f:
                 profile = json.load(f)
             data = profile.get("map")
             if not isinstance(data, dict):
-                raise ValueError("地圖檔格式不正確")
+                raise ValueError("配置檔格式不正確")
         except (OSError, ValueError, TypeError) as e:
-            self.notify(f"載入地圖失敗：{e}", error=True)
+            self.notify(f"讀取配置失敗：{e}", error=True)
             return
         self.stop()
         for key in MAP_PROFILE_KEYS:
             if key in data:
                 self.cfg[key] = data[key]
         self.cfg = migrate_config(self.cfg)
+        self.cfg["active_profile"] = name
         self.kb.repeat = self.cfg.get("key_repeat", True)
         self.vision.hwnd = None
         self.vision.tracker = PlayerTracker()
@@ -3547,23 +3989,28 @@ class App:
         self.bot.step_idx = 0
         save_config(self.cfg)
         self._sync_loaded_map_ui()
-        self.notify(f"已載入地圖：{name}")
+        self.refresh_map_profiles()
+        self.notify(f"配置加載：{name}")
 
     def delete_map_profile(self):
-        name = self.var_map_profile.get().strip()
-        path = self._map_profiles.get(name)
+        name = self.selected_profile()
+        path = self._map_profiles.get(name) if name else None
         if not path:
-            self.notify("請先選擇要刪除的地圖。", error=True)
+            self.notify("請先在清單選取要刪除的配置。", error=True)
             return
-        if not messagebox.askyesno("刪除地圖", f"確定刪除「{name}」？此動作無法復原。"):
+        if not messagebox.askyesno("刪除配置", f"確定刪除「{name}」？此動作無法復原。", parent=self.root):
             return
         try:
             os.remove(path)
         except OSError as e:
-            self.notify(f"刪除地圖失敗：{e}", error=True)
+            self.notify(f"刪除配置失敗：{e}", error=True)
             return
+        if self.cfg.get("active_profile") == name:
+            self.cfg["active_profile"] = None
+            save_config(self.cfg)
+        self.var_profile_name.set("")
         self.refresh_map_profiles()
-        self.notify(f"已刪除地圖：{name}")
+        self.notify(f"已刪除配置：{name}")
 
     def _sync_loaded_map_ui(self):
         """載入地圖後同步可見控制項，無須重開程式。"""
@@ -3622,43 +4069,29 @@ class App:
         if hasattr(self, "wiz_rows"):
             self.rebuild_wizard()
 
-    # ---------------- 主控台 ----------------
+    # ---------------- 掛機地圖 ----------------
     def build_home(self, f):
-        cards = ttk.Frame(f)
-        cards.pack(fill="x")
+        top = ttk.Frame(f)
+        top.pack(fill="x")
+        ttk.Label(top, text="掛機模式", font=(UI_FONT, 10, "bold")).pack(side="left")
         self.var_mode = tk.StringVar(value=self.cfg.get("mode", "anchor"))
-        self.mode_cards = {}
-        for i, key in enumerate(MODE_ORDER):
-            rb = tk.Radiobutton(cards, text=MODE_INFO[key][0], value=key, variable=self.var_mode,
-                                indicatoron=0, command=lambda: self.set_mode(self.var_mode.get()),
-                                font=(UI_FONT, 10, "bold"), padx=6, pady=8, relief="flat", bd=1,
-                                bg="#f3f4f6", activebackground="#e5e7eb", selectcolor="#dbeafe",
-                                fg="#1f2937", cursor="hand2", offrelief="flat", overrelief="groove")
-            rb.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 4, 0))
-            cards.columnconfigure(i, weight=1, uniform="card")
-            self.mode_cards[key] = rb
-        self.lbl_mode_desc = ttk.Label(f, text="", style="Hint.TLabel")
-        self.lbl_mode_desc.pack(anchor="w", pady=(4, 6))
-        self.build_map_memory(f)
+        spec = choice_spec(MODE_ORDER, {k: MODE_INFO[k][0] for k in MODE_ORDER})
+        self.cmb_mode = make_choice(top, self.var_mode, spec, width=14,
+                                    on_change=lambda: self.set_mode(self.var_mode.get()))
+        self.cmb_mode.pack(side="left", padx=(8, 10))
+        self.lbl_mode_desc = autowrap(ttk.Label(top, text="", style="Hint.TLabel", justify="left"))
+        self.lbl_mode_desc.pack(side="left", fill="x", expand=True)
 
-        self.canvas = tk.Canvas(f, height=px(130), bg="#1f2328", highlightthickness=0)
+        mm = ttk.LabelFrame(f, text=" 小地圖 ", padding=(6, 4))
+        mm.pack(fill="x", pady=(6, 6))
+        self.canvas = tk.Canvas(mm, height=px(130), bg="#1f2328", highlightthickness=0)
         self.canvas.pack(fill="x")
         self.canvas.bind("<Motion>", self.on_minimap_motion)
         self.canvas.bind("<Leave>", lambda _e: self.lbl_hover.config(text="游標座標 --"))
         self._tkimg = None
         self._minimap_view = None
-        self.lbl_legend = ttk.Label(f, text="", style="Hint.TLabel")
-        self.lbl_legend.pack(anchor="w", pady=(2, 4))
-
-        # 共用設定摘要（點了直接跳過去）
-        strip = ttk.Frame(f)
-        strip.pack(fill="x", pady=(0, 6))
-        self.sum_links = {}
-        for key, tab in (("buff", "skill"), ("alarm", "alarm")):
-            lb = ttk.Label(strip, text="", style="Link.TLabel", cursor="hand2")
-            lb.pack(side="left", padx=(0, 16))
-            lb.bind("<Button-1>", lambda e, t=tab: self.open_shared(t))
-            self.sum_links[key] = lb
+        self.lbl_legend = autowrap(ttk.Label(mm, text="", style="Hint.TLabel", justify="left"))
+        self.lbl_legend.pack(fill="x", pady=(2, 0))
 
         self.mode_scroll = ScrollFrame(f)
         self.mode_scroll.pack(fill="both", expand=True)
@@ -3669,6 +4102,8 @@ class App:
         }
 
     def set_mode(self, key):
+        if key != self.cfg.get("mode"):
+            log(f"切換模式：{MODE_INFO.get(key, (key,))[0]}")
         self.cfg["mode"] = key
         self.var_mode.set(key)
         self.bot.last_target = None
@@ -3735,6 +4170,14 @@ class App:
                         variable=self.var_anchor_rep, command=self.save_anchor).pack(anchor="w")
         ttk.Checkbutton(adv.body, text="放 Buff 時先放開，放完再按回去",
                         variable=self.var_anchor_buff, command=self.save_anchor).pack(anchor="w")
+        ropes = Collapsible(f, "爬繩／跳台（被怪撞下去時，用這些路線爬回定點）",
+                            opened=bool(self.cfg.get("patrol")))
+        ropes.pack(fill="x", pady=(0, 8))
+        self.build_patrol(ropes.body).pack(fill="x")
+        self.btn_rec_point.pack_forget()
+        self.patrol_box.config(text=" 爬繩／跳台 ")
+        self.lbl_patrol_hint.config(text="站在繩子正下方按「錄製爬繩」，自己爬上去後按錄製結束熱鍵；"
+                                         "跳上浮空平台用「錄製跳台」。往下會自動下跳，不用記。")
         self.update_anchor_label()
         return f
 
@@ -3913,26 +4356,39 @@ class App:
         self.reload_route()
         return f
 
-    # ---------------- 共用設定 ----------------
-    def build_shared(self, f):
-        self.nb_shared = ttk.Notebook(f)
-        self.nb_shared.pack(fill="both", expand=True)
-        self.shared_tabs = {}
-        for key, title, builder in (("skill", "技能／Buff", self.build_skill),
-                                    ("alarm", "警報", self.build_alarm),
-                                    ("yolo", "AI 資料", self.build_yolo_dataset),
-                                    ("keys", "按鍵與熱鍵", self.build_keys),
-                                    ("adv", "手動校正", self.build_detect_adv)):
-            sf = ScrollFrame(self.nb_shared)
-            self.nb_shared.add(sf, text=" " + title + " ")
-            inner = ttk.Frame(sf.inner, padding=(10, 8))
-            inner.pack(fill="both", expand=True)
-            builder(inner)
-            self.shared_tabs[key] = sf
+    # ---------------- 設定分頁 ----------------
+    def build_settings(self, f):
+        cols = ttk.Frame(f)
+        cols.pack(fill="both", expand=True)
+        c0, c1 = ttk.Frame(cols), ttk.Frame(cols)
+        self._settings_wide = None
+
+        def layout(_e=None):
+            wide = cols.winfo_width() >= px(620)
+            if wide == self._settings_wide:
+                return
+            self._settings_wide = wide
+            c0.grid_forget()
+            c1.grid_forget()
+            if wide:
+                cols.columnconfigure(0, weight=1, uniform="setcol")
+                cols.columnconfigure(1, weight=1, uniform="setcol")
+                c0.grid(row=0, column=0, sticky="new", padx=(0, 4))
+                c1.grid(row=0, column=1, sticky="new", padx=(4, 0))
+            else:
+                cols.columnconfigure(0, weight=1, uniform="")
+                cols.columnconfigure(1, weight=0, uniform="")
+                c0.grid(row=0, column=0, sticky="new")
+                c1.grid(row=1, column=0, sticky="new")
+        cols.bind("<Configure>", layout, add="+")
+        layout()
+        self.build_keys(c0)
+        self.build_skill(c1)
+        self.build_options(c1)
 
     def open_shared(self, key):
-        self.nb.select(self.tab_shared)
-        self.nb_shared.select(self.shared_tabs[key])
+        tab = {"skill": "settings", "keys": "settings"}.get(key, key)
+        self.nb.select(self.tabs.get(tab, self.tabs["settings"]))
 
     # ---------------- YOLO 資料收集 ----------------
     def _ensure_yolo_dirs(self):
@@ -4194,14 +4650,11 @@ class App:
         tk.Label(win, image=win._image).pack()
 
     def build_skill(self, f):
-        box = section(f, "Buff／定時技能", "每隔設定的秒數自動施放一次；按開始時，所有啟用的技能會先各放一次。雙擊可編輯。")
-        self.tv_skill = make_tree(box, [("on", "啟用", 50), ("name", "名稱", 160), ("key", "按鍵", 80),
-                                        ("interval", "每隔(秒)", 80), ("delay", "施放後等待", 90)], height=8)
-        self.tv_skill.pack(fill="x")
-        self.tv_skill.bind("<Double-1>", lambda _: self.edit_skill())
-        button_row(box, [("＋ 新增", lambda: self.edit_skill(new=True)), ("編輯", self.edit_skill),
-                         ("啟用／停用", self.toggle_skill), ("刪除", self.del_skill)])
-        box2 = section(f, "持續攻擊", "原地模式、路線的「等待」步驟中，依間隔一直按攻擊鍵。")
+        box = section(f, "Buff／定時技能", "勾選即啟用；每隔設定秒數自動施放，按開始時會先各放一次。直接修改，自動儲存。")
+        self.skill_grid = ttk.Frame(box)
+        self.skill_grid.pack(fill="x")
+        button_row(box, [("＋ 新增技能", self.add_skill)])
+        box2 = section(f, "持續攻擊", "路線的「等待」步驟中，依間隔一直按攻擊鍵。")
         r = ttk.Frame(box2)
         r.pack(fill="x")
         self.var_atk = tk.BooleanVar(value=self.cfg["attack"]["enabled"])
@@ -4336,15 +4789,16 @@ class App:
 
     def build_keys(self, f):
         self.set_vars = getattr(self, "set_vars", {})
-        box = section(f, "遊戲按鍵", "從選單選擇，要和遊戲內的按鍵設定一致。")
+        box = section(f, "按鍵", "從選單選擇，要和遊戲內的按鍵設定一致。")
         g = ttk.Frame(box)
         g.pack(fill="x")
         src = {"key_" + k: v for k, v in self.cfg["keys"].items()}
         form_grid(g, [("key_jump", "跳躍", KEY_SPEC), ("key_attack", "攻擊", KEY_SPEC), ("key_left", "左", KEY_SPEC),
-                      ("key_right", "右", KEY_SPEC), ("key_up", "上（爬繩）", KEY_SPEC), ("key_down", "下", KEY_SPEC)], src, self.set_vars, self.save_settings, width=9)
+                      ("key_right", "右", KEY_SPEC), ("key_up", "上（爬繩）", KEY_SPEC), ("key_down", "下", KEY_SPEC)],
+                  src, self.set_vars, self.save_settings, width=8, label_min=40, choice_min=8)
         button_row(box, [("測試：3 秒後按一下跳躍", self.test_jump)], pady=(8, 0))
 
-        box2 = section(f, "熱鍵與視窗")
+        box2 = section(f, "熱鍵與遊戲視窗")
         g2 = ttk.Frame(box2)
         g2.pack(fill="x")
         src2 = {"hk_toggle": self.cfg["hotkeys"].get("toggle", "f10"), "hk_stop": self.cfg["hotkeys"].get("stop", "f12"),
@@ -4352,21 +4806,27 @@ class App:
                 "window_title": self.cfg["window_title"]}
         form_grid(g2, [("hk_toggle", "開始／暫停", FKEY_SPEC), ("hk_stop", "緊急停止", FKEY_SPEC),
                        ("hk_record", "錄製結束", FKEY_SPEC)], src2,
-                  self.set_vars, self.save_settings, width=9)
+                  self.set_vars, self.save_settings, width=6, label_min=60, choice_min=6)
         g3 = ttk.Frame(box2)
-        g3.pack(fill="x", pady=(4, 0))
-        form_grid(g3, [("window_title", "遊戲視窗標題（包含即可）")], src2, self.set_vars, self.save_settings,
-                  width=24, cols=1)
+        g3.pack(fill="x", pady=(6, 0))
+        ttk.Label(g3, text="視窗標題").pack(side="left")
+        self.set_vars["window_title"] = tk.StringVar(value=str(src2["window_title"]))
+        et = ttk.Entry(g3, textvariable=self.set_vars["window_title"], width=16)
+        et.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        et.bind("<FocusOut>", lambda _e: self.save_settings())
+        et.bind("<Return>", lambda _e: self.save_settings())
         pick = ttk.Frame(box2)
         pick.pack(fill="x", pady=(4, 0))
         self.var_window_pick = tk.StringVar()
-        self.cmb_window_pick = ttk.Combobox(pick, textvariable=self.var_window_pick, state="readonly", width=42)
+        self.cmb_window_pick = ttk.Combobox(pick, textvariable=self.var_window_pick, state="readonly", width=16)
         self.cmb_window_pick.pack(side="left", fill="x", expand=True)
-        ttk.Button(pick, text="重新掃描", command=self.refresh_window_list).pack(side="left", padx=(6, 0))
-        ttk.Button(pick, text="使用選取視窗", command=self.use_selected_window).pack(side="left", padx=(6, 0))
-        ttk.Label(box2, text="找不到遊戲時，從清單手動選取遊戲視窗；會自動填入完整標題並儲存。",
-                  style="Hint.TLabel").pack(anchor="w", pady=(3, 0))
+        ttk.Button(pick, text="掃描", width=5, command=self.refresh_window_list).pack(side="left", padx=(4, 0))
+        ttk.Button(pick, text="使用", width=5, command=self.use_selected_window).pack(side="left", padx=(4, 0))
+        hint(box2, "標題只要包含部分文字即可；找不到遊戲時，從下拉清單選取遊戲視窗按「使用」。", pady=(3, 0))
         self.refresh_window_list()
+
+    def build_options(self, f):
+        box2 = section(f, "基礎")
         self.var_focus = tk.BooleanVar(value=self.cfg.get("only_when_focused", True))
         self.var_top = tk.BooleanVar(value=self.cfg.get("topmost", True))
         ttk.Checkbutton(box2, text="只在遊戲視窗為前景時送出按鍵（建議開啟）", variable=self.var_focus,
@@ -4374,7 +4834,7 @@ class App:
         ttk.Checkbutton(box2, text="本工具視窗置頂", variable=self.var_top,
                         command=self.save_settings).pack(anchor="w")
         self.var_key_repeat = tk.BooleanVar(value=self.cfg.get("key_repeat", True))
-        ttk.Checkbutton(box2, text="按住的鍵持續送出訊號（像實體鍵盤按住；走路、爬繩、按住技能都適用）",
+        ttk.Checkbutton(box2, text="按住的鍵持續送出訊號（像實體鍵盤按住）",
                         variable=self.var_key_repeat, command=self.save_settings).pack(anchor="w")
         self.var_min_start = tk.BooleanVar(value=self.cfg.get("minimize_on_start", True))
         self.var_restore = tk.BooleanVar(value=self.cfg.get("restore_on_pause", True))
@@ -4382,8 +4842,7 @@ class App:
                         command=self.save_settings).pack(anchor="w")
         ttk.Checkbutton(box2, text="暫停／停止時自動還原本工具視窗", variable=self.var_restore,
                         command=self.save_settings).pack(anchor="w")
-        ttk.Label(box2, text="開始／暫停熱鍵只在遊戲或本工具在前景時有效；緊急停止隨時有效。",
-                  style="Hint.TLabel").pack(anchor="w", pady=(4, 0))
+        hint(box2, "開始／暫停熱鍵只在遊戲或本工具在前景時有效；緊急停止隨時有效。", pady=(4, 0))
 
     def open_diag_dir(self):
         os.makedirs(DIAG_DIR, exist_ok=True)
@@ -4467,10 +4926,10 @@ class App:
         """(id, 標題, 說明, 檢查函式, [(按鈕, 指令)], 需要此步驟的模式, 選用的模式)"""
         sc, v, c = self.scanner, self.vision, self.cfg
         mode_pts = {
-            "anchor": ("記錄定點", "到主控台站到掛機位置，按「新增定點」。往上的繩子也要記。",
+            "anchor": ("記錄定點", "到「掛機地圖」站到掛機位置，按「新增定點」。往上的繩子也要記。",
                        lambda: bool(self.bot.anchor_points())),
             "combat": ("記錄巡邏點", "到主控台記錄幾個巡邏點，以及上樓用的繩子。", lambda: bool(c["patrol"])),
-            "buff": ("錄製整張地圖", "到主控台的 BUFF 機按「錄製整張地圖」，自己跑完一輪後按錄製結束熱鍵。",
+            "buff": ("錄製整張地圖", "到「掛機地圖」選 BUFF機，按「錄製隨機路線」，自己跑完一輪後按錄製結束熱鍵。",
                      lambda: bool((c.get("map_macro") or {}).get("events"))),
             "random": ("記錄攻擊點", "到主控台記錄攻擊點，以及上樓用的繩子。", lambda: bool(c["patrol"])),
             "route": ("排好路線", "到主控台用「記錄」與「＋」按鈕排出路線步驟。", lambda: bool(c["route"])),
@@ -4479,7 +4938,7 @@ class App:
         pt = mode_pts.get(mode, mode_pts["anchor"])
         ALL = set(MODE_ORDER)
         return [
-            ("game", "選取遊戲視窗", f"目前目標：「{c['window_title']}」。找不到時可到共用設定，從已開啟視窗清單手動選取。",
+            ("game", "選取遊戲視窗", f"目前目標：「{c['window_title']}」。找不到時可到「設定」頁，從已開啟視窗清單手動選取。",
              lambda: bool(v.hwnd), [("選擇視窗", lambda: self.open_shared("keys")),
                                     ("重新尋找", lambda: setattr(v, "hwnd", None))], ALL, set()),
             ("map", "框選小地圖", "在遊戲截圖上拖曳框住小地圖本體（不含標題列），按 Enter。換地圖或縮放小地圖後要重框。",
@@ -4489,14 +4948,14 @@ class App:
             ("keys", "確認遊戲按鍵", "跳躍、攻擊、方向鍵要和遊戲內一致，按「測試跳躍」確認。",
              lambda: bool(c.get("setup_keys_ok")),
              [("按鍵設定", lambda: self.open_shared("keys")), ("測試跳躍", self.test_jump)], ALL, set()),
-            ("points", pt[0], pt[1], pt[2], [("到主控台", lambda: self.nb.select(self.tab_home))], ALL, set()),
+            ("points", pt[0], pt[1], pt[2], [("到掛機地圖", lambda: self.nb.select(self.tab_home))], ALL, set()),
             ("tag", "框選角色名牌", "框選自己角色腳下的名牌（不要框到角色）。設定物品範本後，撿物功能才需要它。",
              lambda: sc.tag_template is not None, [("框選名牌", self.set_nametag)], set(), {"buff"}),
             ("mob", "框選怪物範本", "框選這張地圖的怪物，不同動作可多存幾張。",
              lambda: bool(sc.mon_templates), [("新增怪物範本", self.add_monster_template)], {"combat"}, {"random", "route"}),
             ("item", "框選物品範本", "框選地上的楓幣、常掉的道具；沒有範本時只會連點撿物＋掃地。",
              lambda: bool(sc.item_templates), [("新增物品範本", self.add_item_template)], set(), {"buff"}),
-            ("buffs", "設定 Buff", "在「共用設定 → 技能／Buff」新增要定時施放的技能。",
+            ("buffs", "設定 Buff", "在「設定」頁的 Buff／定時技能表新增要定時施放的技能。",
              lambda: any(s.get("enabled") for s in c["skills"]), [("前往設定", lambda: self.open_shared("skill"))],
              set(), ALL),
             ("lie", "測謊範本", "測謊出現時框選視窗特徵，之後偵測到會暫停並警報。",
@@ -4609,13 +5068,19 @@ class App:
         mode_name = MODE_INFO.get(self.cfg.get("mode"), ("", ""))[0]
         if b.active.is_set():
             self.lbl_status.config(text=f"{mode_name}　▶ {b.status}")
+            self._log_status(b.status)
         else:
-            self.lbl_status.config(text=f"{mode_name}　暫停中（按 {hk_t} 或「開始」）")
+            self.lbl_status.config(text=f"{mode_name}　暫停中（按 {hk_t} 或「開始掛機」）")
+            self._log_status(None)
         elite_on = (v.elite_templates and self.cfg["elite"].get("enabled")
                     and time.time() - v.elite_seen_at < float(self.cfg["elite"].get("end_sec", 3)))
         self.lbl_status.config(foreground=C_BAD if elite_on else C_ACCENT)
-        self.btn_run.config(text=f"⏸ 暫停 ({hk_t})" if b.active.is_set() else f"▶ 開始 ({hk_t})")
-        self.btn_stop.config(text=f"■ 停止 ({hk_s})")
+        word = "" if self._side_compact else "掛機"
+        run_text = f"⏸ 暫停 ({hk_t})" if b.active.is_set() else f"▶ 開始{word} ({hk_t})"
+        if self.btn_run.cget("text") != run_text:
+            self.btn_run.config(text=run_text)
+        if self.btn_stop.cget("text") != f"■ 停止{word} ({hk_s})":
+            self.btn_stop.config(text=f"■ 停止{word} ({hk_s})")
         self.draw_minimap()
 
         self._tick += 1
@@ -4629,11 +5094,6 @@ class App:
             elif self.setup_frame.winfo_ismapped():
                 self.setup_frame.pack_forget()
             self.update_wizard()
-            n_buff = sum(1 for s in self.cfg["skills"] if s.get("enabled"))
-            self.sum_links["buff"].config(text=f"Buff：{n_buff} 個啟用 →")
-            ld_on = self.cfg["lie_detector"].get("enabled") and v.templates
-            rd_on = self.cfg["red_dot"].get("enabled")
-            self.sum_links["alarm"].config(text=f"警報：測謊{'開' if ld_on else '未設定'}、紅點{'開' if rd_on else '關'} →")
         self.root.after(100, self.refresh)
 
     def overlap_warning(self):
@@ -4661,7 +5121,8 @@ class App:
         cw = max(self.canvas.winfo_width(), 100)
         if img is None:
             msg = "尚未框選小地圖（到「首次設定」框選）" if not self.cfg.get("minimap") else "等待遊戲畫面…"
-            self.canvas.config(height=px(60))
+            if self.canvas.winfo_height() > px(80):
+                self.canvas.config(height=px(60))
             self.canvas.create_text(cw // 2, px(30), text=msg, fill="#9ca3af", font=(UI_FONT, 10))
             self._minimap_view = None
             return
@@ -4756,7 +5217,7 @@ class App:
                 try:
                     fn()
                 except Exception as e:
-                    print("UI 更新錯誤：", e)
+                    log_exception("介面更新錯誤", e)
         except queue.Empty:
             pass
         if self.alive_ui:
@@ -4772,52 +5233,83 @@ class App:
         save_config(self.cfg)
 
     def reload_skills(self):
-        self.tv_skill.delete(*self.tv_skill.get_children())
-        for i, s in enumerate(self.cfg["skills"]):
-            self.tv_skill.insert("", "end", iid=str(i), values=(
-                "✔" if s.get("enabled") else "", s["name"], s["key"], s["interval"], s.get("delay", 0.6)))
+        g = self.skill_grid
+        for w in g.winfo_children():
+            w.destroy()
+        for c, t in enumerate(("啟用", "名稱", "按鍵", "每隔(秒)", "施放後等待", "")):
+            ttk.Label(g, text=t, style="Hint.TLabel").grid(row=0, column=c, sticky="w", padx=2)
+        g.columnconfigure(1, weight=1)
+        self.skill_rows = []
+        num = lambda v: (f"{float(v):g}" if isinstance(v, (int, float)) else str(v))
+        for i, sk in enumerate(self.cfg["skills"]):
+            r = i + 1
+            on = tk.BooleanVar(value=bool(sk.get("enabled")))
+            name = tk.StringVar(value=str(sk.get("name", "")))
+            key = tk.StringVar(value=str(sk.get("key", "")))
+            itv = tk.StringVar(value=num(sk.get("interval", 60)))
+            dly = tk.StringVar(value=num(sk.get("delay", 0.6)))
+            save = (lambda i=i: self.save_skill_row(i))
+            ttk.Checkbutton(g, variable=on, command=save).grid(row=r, column=0, padx=(6, 2))
+            entries = []
+            e = ttk.Entry(g, textvariable=name, width=9)
+            e.grid(row=r, column=1, sticky="we", padx=2, pady=1)
+            entries.append(e)
+            make_choice(g, key, KEY_SPEC, width=7, on_change=save).grid(row=r, column=2, padx=2, pady=1)
+            for col, var in ((3, itv), (4, dly)):
+                e = ttk.Entry(g, textvariable=var, width=6)
+                e.grid(row=r, column=col, padx=2, pady=1)
+                entries.append(e)
+            for e in entries:
+                e.bind("<FocusOut>", lambda _e, sv=save: sv())
+                e.bind("<Return>", lambda _e, sv=save: sv())
+            ttk.Button(g, text="✕", width=3, command=lambda i=i: self.del_skill(i)).grid(row=r, column=5, padx=(2, 0))
+            self.skill_rows.append((on, name, key, itv, dly))
+        if not self.cfg["skills"]:
+            ttk.Label(g, text="尚未新增技能", style="Hint.TLabel").grid(row=1, column=0, columnspan=6, sticky="w")
+
+    def save_skill_row(self, i):
+        if i >= len(self.cfg["skills"]) or i >= len(self.skill_rows):
+            return
+        on, name, key, itv, dly = self.skill_rows[i]
+        sk = self.cfg["skills"][i]
+        try:
+            interval, delay = float(itv.get()), float(dly.get())
+            if interval <= 0 or delay < 0:
+                raise ValueError
+        except ValueError:
+            self.notify(f"技能「{name.get()}」的秒數要填正數", error=True)
+            return
+        k = key.get().strip().lower()
+        if k not in SCANCODES:
+            self.notify(f"不支援的按鍵：{k}", error=True)
+            return
+        new = dict(sk, enabled=on.get(), name=name.get().strip() or f"技能{i + 1}", key=k,
+                   interval=interval, delay=delay)
+        if new != sk:
+            if new["enabled"] != sk.get("enabled"):
+                log(f"技能「{new['name']}」{'啟用' if new['enabled'] else '停用'}")
+            self.cfg["skills"][i] = new
+            save_config(self.cfg)
+
+    def add_skill(self):
+        n = len(self.cfg["skills"]) + 1
+        self.cfg["skills"].append({"name": f"技能{n}", "key": "q", "interval": 60.0, "enabled": True, "delay": 0.6})
+        save_config(self.cfg)
+        self.reload_skills()
+        self.notify(f"已新增技能{n}：請選擇按鍵並設定秒數。")
+
+    def del_skill(self, i):
+        if 0 <= i < len(self.cfg["skills"]):
+            name = self.cfg["skills"][i].get("name", "")
+            del self.cfg["skills"][i]
+            self.bot.skill_last = {}
+            save_config(self.cfg)
+            self.reload_skills()
+            self.notify(f"已刪除技能：{name}")
 
     def sel_index(self, tv):
         sel = tv.selection()
         return int(sel[0]) if sel else None
-
-    def edit_skill(self, new=False):
-        idx = None if new else self.sel_index(self.tv_skill)
-        if not new and idx is None:
-            return
-        s = {"name": "新技能", "key": "q", "interval": 60, "enabled": True, "delay": 0.6} if new \
-            else dict(self.cfg["skills"][idx])
-        d = FormDialog(self.root, "技能設定", [
-            ("name", "名稱", s["name"]), ("key", "按鍵", s["key"], KEY_SPEC),
-            ("interval", "每隔幾秒", s["interval"]), ("delay", "施放後等待(秒)", s.get("delay", 0.6))])
-        if not d.result:
-            return
-        r = d.result
-        if r["key"].lower() not in SCANCODES:
-            self.notify(f"不支援的按鍵：{r['key']}\n可用：{', '.join(SCANCODES)}", error=True)
-            return
-        s.update(name=r["name"], key=r["key"].lower(), interval=float(r["interval"]), delay=float(r["delay"]))
-        if new:
-            self.cfg["skills"].append(s)
-        else:
-            self.cfg["skills"][idx] = s
-        save_config(self.cfg)
-        self.reload_skills()
-
-    def toggle_skill(self):
-        idx = self.sel_index(self.tv_skill)
-        if idx is not None:
-            self.cfg["skills"][idx]["enabled"] = not self.cfg["skills"][idx].get("enabled")
-            save_config(self.cfg)
-            self.reload_skills()
-
-    def del_skill(self):
-        idx = self.sel_index(self.tv_skill)
-        if idx is not None:
-            del self.cfg["skills"][idx]
-            self.bot.skill_last = {}
-            save_config(self.cfg)
-            self.reload_skills()
 
     # ---------------- 定點掛機 ----------------
     def update_anchor_label(self):
@@ -5204,7 +5696,7 @@ class App:
         if pause:
             self.bot.active.clear()
             self.kb.release_all()
-        print("警報：", text)
+        log(f"警報：{text}", "warn")
         tail = "已自動暫停，請回遊戲自己作答" if kind == "lie" else ("已自動暫停" if pause else "自動仍在執行")
         msg = f"⚠ {text}\n{tail}"
         self.ui(lambda: self._show_alarm(msg))
@@ -5241,6 +5733,8 @@ class App:
             self.ui(self.dismiss_alarm)
 
     def dismiss_alarm(self):
+        if self.alarm_kind:
+            log("警報已解除")
         if self.alarm_kind == "lie":
             self.vision.last_ld_check = time.time() + 5  # 給測謊視窗 5 秒時間關閉
         self.alarm_kind = None
@@ -5295,7 +5789,8 @@ class App:
             try:
                 self.kb.tap(self.cfg["keys"]["jump"])
             except InputSendError as e:
-                self.ui(lambda: self.notify(str(e), error=True))
+                msg = str(e)
+                self.ui(lambda m=msg: self.notify(m, error=True))
                 return
             self.cfg["setup_keys_ok"] = True
             save_config(self.cfg)
@@ -5679,6 +6174,7 @@ class App:
             else:
                 on_saved(rec)
 
+        log(f"開始錄製{what}（{hk.get('record', 'f8').upper()} 結束）")
         self.recorder = KeyRecorder(self, done, max_sec=max_sec)
         self.root.iconify()
         self.root.after(150, lambda: activate_window(self.vision.hwnd))
@@ -5837,6 +6333,7 @@ class App:
     def toggle_run(self):
         if self.bot.active.is_set():
             self.bot.active.clear()
+            log("暫停掛機")
             self._after_pause()
         else:
             if self.alarm_kind == "lie":
@@ -5856,6 +6353,8 @@ class App:
             self.bot.nav_fail = 0
             self.bot.anchor_dwell = None
             self.bot.active.set()
+            n_buff = sum(1 for sk in self.cfg["skills"] if sk.get("enabled"))
+            log(f"開始掛機：{MODE_INFO.get(mode, (mode,))[0]}（Buff {n_buff} 個）")
             self._after_start()
 
     def stop(self):
@@ -5864,6 +6363,7 @@ class App:
         self.bot.step_idx = 0
         self.kb.release_all()
         if was_running:
+            log("停止掛機")
             self._after_pause()
 
     def _hotkey_focus_ok(self):
@@ -5929,6 +6429,14 @@ class App:
         text = f"發現新版 {tag}（目前 {APP_VERSION}）。\n\n要下載並更新嗎？"
         if notes:
             text += "\n\n更新內容：\n" + notes[:700]
+        log(f"發現新版 {tag}")
+        if getattr(sys, "frozen", False):   # 打包成 exe 的版本無法直接覆寫原始碼，改開下載頁
+            if messagebox.askyesno("有新版本", f"發現新版 {tag}（目前 {APP_VERSION}）。\n\n"
+                                   "執行檔版本無法自動更新，要開啟下載頁嗎？下載後重新執行「打包成exe.bat」。",
+                                   parent=self.root):
+                import webbrowser
+                webbrowser.open(release.get("html_url") or f"https://github.com/{UPDATE_REPOSITORY}/releases/latest")
+            return
         if messagebox.askyesno("有新版本", text, parent=self.root):
             threading.Thread(target=self.download_and_apply_update, args=(asset,), daemon=True).start()
 
@@ -5940,6 +6448,15 @@ class App:
             req = urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": f"MapleHelper/{APP_VERSION}"})
             with urllib.request.urlopen(req, timeout=30) as response, open(archive, "wb") as out:
                 shutil.copyfileobj(response, out)
+            digest = str(asset.get("digest") or "")
+            if digest.lower().startswith("sha256:"):
+                h = hashlib.sha256()
+                with open(archive, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(chunk)
+                if h.hexdigest().lower() != digest.split(":", 1)[1].strip().lower():
+                    raise ValueError("更新檔校驗碼不符（下載不完整或檔案被竄改），已取消更新")
+                log("更新檔 SHA-256 校驗通過")
             unpacked = os.path.join(stage, "unpacked")
             os.makedirs(unpacked, exist_ok=True)
             with zipfile.ZipFile(archive) as zf:
@@ -5965,12 +6482,15 @@ class App:
                 raise ValueError("更新檔不完整")
             self.ui(lambda: self.finish_update(payload, names))
         except Exception as e:
-            self.ui(lambda: self.notify(f"下載更新失敗：{e}", error=True))
+            msg = f"下載更新失敗：{e}"
+            log_exception("下載更新失敗", e)
+            self.ui(lambda m=msg: self.notify(m, error=True))
 
     def finish_update(self, payload, names):
         if not self.alive_ui:
             return
         self.notify("下載完成，正在更新並重新開啟…")
+        log(f"套用更新：{', '.join(names)}")
         # 不使用 .cmd：cmd 對中文資料夾／檔名的編碼常會變成亂碼。
         # 以 Unicode 參數直接啟動短暫的 Python 更新助手，保留使用者的設定與地圖資料。
         helper = (
@@ -5979,7 +6499,8 @@ class App:
             "src,dst,py,entry,names=sys.argv[1:6];"
             "[(os.makedirs(os.path.dirname(os.path.join(dst,n)),exist_ok=True),"
             "shutil.copy2(os.path.join(src,n),os.path.join(dst,n))) for n in json.loads(names) "
-            "if os.path.isfile(os.path.join(src,n))];"
+            "if os.path.isfile(os.path.join(src,n)) and not (n.startswith('yolo_data') "
+            "and os.path.exists(os.path.join(dst,n)))];"
             "subprocess.Popen([py,entry],cwd=dst)"
         )
         subprocess.Popen([sys.executable, "-c", helper, payload, APP_DIR, sys.executable,
@@ -5988,6 +6509,9 @@ class App:
         self.root.after(300, self.on_close)
 
     def on_close(self):
+        log("關閉工具")
+        if self._on_log in EVENT_LOG.listeners:
+            EVENT_LOG.listeners.remove(self._on_log)
         self.alive_ui = False
         self.yolo_collecting = False
         if self._yolo_capture_job:

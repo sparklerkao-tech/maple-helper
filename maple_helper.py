@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.1"
+APP_VERSION = "v4.1.2"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -75,7 +75,8 @@ DEFAULT_CONFIG = {
     "keys": {"jump": "alt", "attack": "ctrl", "left": "left", "right": "right",
              "up": "up", "down": "down"},
     "attack": {"enabled": False, "interval": 0.6},
-    "buff_start_wait": 1.0,   # 開始時放完全部 Buff 後，再等幾秒才開始移動（等最後一個 Buff 動作結束）
+    "buff_start_wait": 1.0,
+    "rope_prehold": True,     # 快走到繩子時先按住上（不用跳的繩子），到繩下馬上抓住   # 開始時放完全部 Buff 後，再等幾秒才開始移動（等最後一個 Buff 動作結束）
     "skills": [
         {"name": "Buff 範例", "key": "home", "interval": 180, "enabled": False, "delay": 0.8},
     ],
@@ -106,6 +107,7 @@ DEFAULT_CONFIG = {
         "imgsz": 960,
         # 路線爬繩時，先用畫面上的 YOLO 繩子框做最後對位；沒有結果會自動退回原本的小地圖／微調流程。
         "rope_assist": True,
+        "rope_dx": None,       # 角色站在抓得到繩子的位置時，YOLO 繩子中心 − 角色中心（自動學習；還沒學到就不用 YOLO 推位置）
         # 各類別信心門檻（低於門檻的框不採用）；道具與繩子的信心通常比怪物、人物低
         "class_conf": {"monster": 0.45, "item": 0.35, "rope": 0.25, "player": 0.45},
     },
@@ -1927,12 +1929,16 @@ class Bot(threading.Thread):
         log(f"開始時 Buff 放完（{len(enabled)} 個），開始移動")
 
     # ---- 動作 ----
-    def goto(self, tx, tol=None, timeout=10):
+    def goto(self, tx, tol=None, timeout=10, prehold=None, prehold_dist=4):
         """走到小地圖 X 座標：方向鍵全程按住，到點才放開（走過頭就按住反方向）。
 
         只有在要求非常精準（tol ≤ 1，例如對準繩子）且剩最後 2 格時，才用短按微調。
+        prehold＝快到目標（距離 ≤ prehold_dist）時先按住的鍵（例如上），經過繩子時就會直接抓住；
+        一旦角色開始往上爬，就設 self.early_grab 並結束（按住的鍵交給呼叫端放開）。
         """
         tol = self.cfg["goto_tolerance"] if tol is None else tol
+        self.early_grab = False
+        self._prehold_y0 = None
         self.status = f"移動到 X={tx}"
         start = time.time()
         last_x, last_move = None, time.time()
@@ -1947,6 +1953,15 @@ class Bot(threading.Thread):
                     time.sleep(0.03)
                     continue
                 dx = tx - p[0]
+                if prehold:
+                    if self._prehold_y0 is None:
+                        self._prehold_y0 = p[1]
+                    if abs(dx) <= prehold_dist and prehold not in self.kb.held:
+                        self.kb.down(prehold)
+                        self.status = f"接近繩子，先按住上（X={tx}）"
+                    if p[1] <= self._prehold_y0 - 2:      # 已經抓到繩子往上爬了
+                        self.early_grab = True
+                        return True
                 if abs(dx) <= tol:
                     if cur_dir:   # 到點：放開，等角色停穩再確認一次
                         self.kb.up(cur_dir)
@@ -2050,35 +2065,59 @@ class Bot(threading.Thread):
         self._px_time = px_time
         return False
 
-    def yolo_align_rope(self, max_distance=180):
+    def yolo_rope_delta(self, img=None, max_distance=180):
+        """畫面上最近的繩子中心 − 角色中心（px）；找不到回傳 None"""
+        yolo_cfg = self.cfg.get("yolo", {})
+        detector = self.app.scanner.yolo
+        tag = self.app.scanner.tag_template
+        if not yolo_cfg.get("rope_assist", True) or tag is None or not detector.has_class("rope"):
+            return None
+        if img is None:
+            img = self.app.vision.grab_client()
+        if img is None:
+            return None
+        char = locate_char(img, tag)
+        ropes = detector.detect_classes(img, "rope")
+        if char is None or not ropes:
+            return None
+        rope = min(ropes, key=lambda r: abs(r[0] - char[0]))
+        delta = int(rope[0] - char[0])
+        return delta if abs(delta) <= max_distance else None
+
+    def learn_rope_dx(self, rope, delta):
+        """角色確定站在抓得到繩子的位置時呼叫：記下這條繩子的 YOLO 偏移，並更新全域平均"""
+        if delta is None:
+            return
+        if rope is not None:
+            rope["yolo_dx"] = int(delta)
+        yc = self.cfg.setdefault("yolo", {})
+        old = yc.get("rope_dx")
+        yc["rope_dx"] = int(round(delta if old in (None, 0) else 0.7 * float(old) + 0.3 * delta))
+
+    def yolo_align_rope(self, max_distance=180, rope=None):
         """依畫面辨識到的繩子做最後水平對位。
 
         小地圖座標先負責走到「哪一根繩子」附近；這一步再用 YOLO 的繩子框修正實際畫面
         的左右誤差，特別適合小地圖格子與角色實際抓繩點不完全一致的情況。
         找不到人物名牌、模型或足夠近的繩子時安全地交回既有流程。
         """
-        yolo_cfg = self.cfg.get("yolo", {})
-        detector = self.app.scanner.yolo
-        tag = self.app.scanner.tag_template
-        if not yolo_cfg.get("rope_assist", True) or tag is None or not detector.has_class("rope"):
+        measured = self.yolo_rope_delta(max_distance=max_distance)
+        if measured is None:
             return False
-        img = self.app.vision.grab_client()
-        char = locate_char(img, tag)
-        ropes = detector.detect_classes(img, "rope") if img is not None else None
-        if char is None or not ropes:
+        # 角色抓得到繩子時，名牌中心和 YOLO 繩子中心本來就有固定偏移；對到「學到的偏移」而不是 0
+        target = (rope or {}).get("yolo_dx", self.cfg.get("yolo", {}).get("rope_dx"))
+        if target is None:
+            # 還不知道「抓得到繩子時」的偏移：不要用 YOLO 硬推到繩子正中間（名牌中心和繩子中心本來就有差）
             return False
-        char_x = char[0]
-        rope = min(ropes, key=lambda r: abs(r[0] - char_x))
-        delta = int(rope[0] - char_x)
-        if abs(delta) > max_distance:
-            return False
-        if abs(delta) <= 4:
+        target = int(target)
+        delta = int(measured - target)
+        if abs(delta) <= 6:
             self.status = "YOLO 繩子對位完成"
             return True
         # 只做一次短距離修正；接下來仍由 grab_rope 的微調保證不會因誤判跑到遠處。
         px_time = self.__dict__.get("_px_time", 0.008)
         hold = min(0.38, max(0.025, abs(delta) * px_time))
-        self.status = f"YOLO 繩子對位：差 {delta:+d} px"
+        self.status = f"YOLO 繩子對位：差 {delta:+d} px（偏移 {target:+d}）"
         self.kb.tap(self.key("right") if delta > 0 else self.key("left"), hold)
         self.sleep(0.10, do_skills=False)
         return True
@@ -2157,26 +2196,34 @@ class Bot(threading.Thread):
             time.sleep(0.03)
         return True
 
-    def climb_rope(self, rope_x, top_y=None, attempts=3, jump_to_grab=False, anchor=None):
-        """上繩：走到繩下 → 按住上（抓不到就微調）→ 按住到頂 → 確認真的到了上一層"""
+    def climb_rope(self, rope_x, top_y=None, attempts=3, jump_to_grab=False, anchor=None, rope=None):
+        """上繩：走向繩子（快到時先按住上）→ 精準對位 → 按住上（抓不到就微調）→ 按住到頂 → 確認到了上一層"""
         tol = int(self.popt("plat_tol"))
         self.last_climb_land = None
+        up = self.key("up")
+        prehold = up if (not jump_to_grab and self.cfg.get("rope_prehold", True)) else None
         for attempt in range(attempts):
-            if not self.goto(rope_x, tol=self.cfg["rope_tolerance"]):
-                continue
-            self.sleep(0.12, do_skills=False)
-            if anchor:
-                self.screen_align(anchor)
-            # 即使尚未為這根繩子建立畫面地標，也可以用訓練好的 YOLO 繩子類別完成最後對位。
-            self.yolo_align_rope()
-            p0 = self.pos()
-            if p0 is None:
-                continue
-            self.status = f"爬繩 X={rope_x}（第 {attempt + 1} 次）"
-            self.climbing = True
-            up = self.key("up")
+            p0 = None
             try:
-                if self.grab_rope(up, rope_x, -1, jump_to_grab):
+                if not self.goto(rope_x, tol=self.cfg["rope_tolerance"], prehold=prehold):
+                    continue
+                if self.early_grab:                       # 走過去時已經抓到繩子
+                    p0 = (rope_x, self._prehold_y0)
+                else:
+                    self.quiet_wait(0.12)
+                    aligned = bool(anchor) and self.screen_align(anchor)
+                    if aligned:
+                        # 精準地標對準＝角色站在記錄時抓得到繩子的位置：順便記下 YOLO 偏移，之後沒有地標時也對得準
+                        if rope is not None and "yolo_dx" not in rope:
+                            self.learn_rope_dx(rope, self.yolo_rope_delta())
+                    else:
+                        self.yolo_align_rope(rope=rope)
+                    p0 = self.pos()
+                if p0 is None or p0[1] is None:
+                    continue
+                self.status = f"爬繩 X={rope_x}（第 {attempt + 1} 次）"
+                self.climbing = True
+                if self.early_grab or self.grab_rope(up, rope_x, -1, jump_to_grab):
                     self.status = f"爬繩中 X={rope_x}"
                     self.ride_rope(-1, top_y)
             finally:
@@ -2191,13 +2238,13 @@ class Bot(threading.Thread):
         self.status = "爬繩失敗，跳過"
         return False
 
-    def climb_down(self, rope_x, bottom_y=None):
-        """下繩：走到繩子頂端 → 按住下（抓不到就微調）→ 按住到底 → 確認真的到了下一層"""
+    def climb_down(self, rope_x, bottom_y=None, rope=None):
+        """下繩：走到繩子頂端 → 按住下（抓不到就微調）→ 按住到底、角色落地 → 確認真的到了下一層"""
         tol = int(self.popt("plat_tol"))
         if not self.goto(rope_x, tol=self.cfg["rope_tolerance"]):
             return False
-        self.sleep(0.12, do_skills=False)
-        self.yolo_align_rope()
+        self.quiet_wait(0.12)
+        self.yolo_align_rope(rope=rope)
         p0 = self.pos()
         if p0 is None:
             return False
@@ -2207,7 +2254,9 @@ class Bot(threading.Thread):
         try:
             if self.grab_rope(down, rope_x, +1):
                 self.status = f"下繩中 X={rope_x}"
-                self.ride_rope(+1, bottom_y)
+                # 不在 bottom_y 就放開：小地圖 1 格約 12～15 px，到那一格時角色常常還掛在繩子上
+                self.ride_rope(+1, None)
+                self.quiet_wait(0.25)                     # 到底後再多按一下，確定落地
         finally:
             self.kb.up(down)
             self.climbing = False
@@ -2361,7 +2410,7 @@ class Bot(threading.Thread):
         if l["kind"] == "up":
             return self.climb_and_learn(r)
         if l["kind"] == "down":
-            return self.climb_down(l["sx"], l["ey"])
+            return self.climb_down(l["sx"], l["ey"], rope=r)
         # 跳台：重播錄製的跳躍，確認落在錄製時的位置
         self.status = f"跳台：({l['sx']},{l['sy']}) → ({l['ex']},{l['ey']})"
         self.play_macro(r["macro"], anchor=r.get("screen_anchor"))
@@ -2521,7 +2570,7 @@ class Bot(threading.Thread):
                     return True
                 self.sleep(0.5, do_skills=False)
             self.status = "錄製動作沒有爬上去，改用自動爬繩"
-        ok = self.climb_rope(int(r["x"]), jump_to_grab=r.get("jump_to_grab", False),
+        ok = self.climb_rope(int(r["x"]), jump_to_grab=r.get("jump_to_grab", False), rope=r,
                              anchor=r.get("screen_anchor"))
         land = getattr(self, "last_climb_land", None)
         if ok and land and r.get("lands_y") != land[1]:   # 只有確認爬上去、站穩後才記落點
@@ -2746,6 +2795,8 @@ class Bot(threading.Thread):
     def anchor_drifted(self, p):
         a = self.cfg["anchor"]
         ax, ay = self.anchor_xy()
+        if not a.get("use_ropes", False):      # 不爬繩：只看左右，掉到別層就在那一層的定點 X 繼續打
+            return abs(p[0] - ax) > int(a.get("tol_x", 4))
         return (abs(p[0] - ax) > int(a.get("tol_x", 4))
                 or abs(p[1] - ay) > int(self.cfg["patrol_opt"]["plat_tol"]))
 
@@ -2756,6 +2807,14 @@ class Bot(threading.Thread):
         self.kb.release_all()
         self.status = f"{reason}，前往定點 #{self.anchor_idx + 1} ({ax},{ay})"
         self.app.highlight_anchor(self.anchor_idx)
+        if not a.get("use_ropes", False):
+            # 定點掛機不爬繩：只在目前這一層左右走回定點 X
+            ok = self.goto(ax, tol=int(a.get("tol_x", 4)))
+            self.nav_fail = 0 if ok else self.nav_fail + 1
+            if self.nav_fail >= 6:
+                self.app.trigger_alarm("stuck", "定點掛機：連續多次走不到定點", pause=True, beep=True)
+                self.nav_fail = 0
+            return ok
         ok = self.navigate(ax, ay)
         if ok:
             self.nav_fail = 0
@@ -3307,7 +3366,7 @@ C_BAD = "#c62828"
 C_WARN = "#b26a00"
 
 MODE_INFO = {
-    "anchor": ("◎ 定點掛機", "站在定點按住範圍技，定時換點；被打下去會自動爬回來。"),
+    "anchor": ("◎ 定點掛機", "站在定點按住範圍技，定時換點；不爬繩，被撞開會在同一層走回定點 X。"),
     "buff": ("✚ BUFF機", "依整張地圖的錄製路徑循環移動、放 Buff、撿物，不自動攻擊。"),
 }
 MODE_ORDER = ["anchor", "buff"]
@@ -4215,7 +4274,8 @@ class App:
             p.pack_forget()
         self.pn_patrol.pack_forget()
         self.pn[mode].pack(fill="x")
-        self.pn_patrol.pack(fill="x")
+        if mode == "buff":                    # 定點掛機不爬繩，不顯示繩下定點區
+            self.pn_patrol.pack(fill="x")
         if mode == "buff":
             self.lbl_patrol_hint.config(text="站在繩子正下方按「＋ 繩下定點」記錄繩子位置；爬不穩就改用「● 錄製爬繩」親手爬一次。"
                                              "沒有錄製全圖路線時，BUFF 機會在巡邏點與繩子之間隨機移動。")
@@ -4958,6 +5018,9 @@ class App:
                         command=self.save_settings).pack(anchor="w")
         ttk.Checkbutton(box2, text="暫停／停止時自動還原本工具視窗", variable=self.var_restore,
                         command=self.save_settings).pack(anchor="w")
+        self.var_prehold = tk.BooleanVar(value=self.cfg.get("rope_prehold", True))
+        ttk.Checkbutton(box2, text="接近繩子時先按住上（不用跳的繩子）", variable=self.var_prehold,
+                        command=self.save_settings).pack(anchor="w")
         hint(box2, "開始／暫停熱鍵只在遊戲或本工具在前景時有效；緊急停止隨時有效。", pady=(4, 0))
 
     def open_diag_dir(self):
@@ -5042,7 +5105,7 @@ class App:
         """(id, 標題, 說明, 檢查函式, [(按鈕, 指令)], 需要此步驟的模式, 選用的模式)"""
         sc, v, c = self.scanner, self.vision, self.cfg
         mode_pts = {
-            "anchor": ("記錄定點", "到「掛機地圖」站到掛機位置，按「新增定點」。往上的繩子也要記。",
+            "anchor": ("記錄定點", "到「掛機地圖」站到掛機位置，按「新增定點」。",
                        lambda: bool(self.bot.anchor_points())),
             "combat": ("記錄巡邏點", "到主控台記錄幾個巡邏點，以及上樓用的繩子。", lambda: bool(c["patrol"])),
             "buff": ("錄製整張地圖", "到「掛機地圖」選 BUFF機，按「錄製隨機路線」，自己跑完一輪後按錄製結束熱鍵。",
@@ -5700,6 +5763,10 @@ class App:
                 img = None
         if img is None:
             return "（擷取不到遊戲畫面）"
+        try:   # 角色正站在抓得到繩子的位置：記下 YOLO 繩子偏移（有模型時）
+            self.bot.learn_rope_dx(rope, self.bot.yolo_rope_delta(img))
+        except Exception as e:
+            log(f"記錄 YOLO 繩子偏移失敗：{e}", "warn")
         crop, meta = make_rope_anchor(img, self.scanner.tag_template)
         if crop is None:
             return f"（無法精準對位：{meta}）"
@@ -5908,6 +5975,8 @@ class App:
         self.cfg["key_repeat"] = self.var_key_repeat.get()
         self.kb.repeat = self.cfg["key_repeat"]
         self.cfg["restore_on_pause"] = self.var_restore.get()
+        if hasattr(self, "var_prehold"):
+            self.cfg["rope_prehold"] = self.var_prehold.get()
         self.root.attributes("-topmost", self.cfg["topmost"])
         save_config(self.cfg)
 

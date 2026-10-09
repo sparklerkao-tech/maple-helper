@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v3.9.1"
+APP_VERSION = "v3.9.2"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -3904,6 +3904,9 @@ class App:
         self.yolo_collecting = True
         self.btn_yolo_collect.config(text="停止收集")
         self._yolo_capture_tick()
+        # 資料收集開始後不遮住遊戲；需要停止時從工作列點回本工具即可。
+        self.root.iconify()
+        self.root.after(150, lambda: activate_window(self.vision.hwnd))
 
     def _yolo_capture_tick(self):
         if not self.yolo_collecting or not self.alive_ui:

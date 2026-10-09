@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.0.0"
+APP_VERSION = "v4.0.1"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -182,6 +182,9 @@ ROPE_DIR = os.path.join(TEMPLATE_DIR, "ropes")
 YOLO_DATA_DIR = os.path.join(APP_DIR, "yolo_data")
 YOLO_IMAGES_DIR = os.path.join(YOLO_DATA_DIR, "images")
 YOLO_LABELS_DIR = os.path.join(YOLO_DATA_DIR, "labels")
+YOLO_CLASS_NAMES = ("monster", "item", "rope", "player")
+YOLO_CLASS_LABELS = ("怪物", "道具", "繩子", "人物")
+YOLO_CLASS_COLORS = ("#00ff66", "#ff4fd8", "#ffb000", "#00d9ff")
 
 
 def imread_unicode(path):
@@ -949,8 +952,8 @@ class YoloMonsterDetector:
             self.error = f"YOLO 無法載入：{e}"
             return False
 
-    def detect(self, img_bgr):
-        """成功時回傳怪物列表；模型未可用時回傳 None，讓呼叫端退回舊辨識。"""
+    def detect_classes(self, img_bgr, wanted=None):
+        """成功時回傳指定類別（或全部）的 YOLO 結果；模型未可用時回傳 None。"""
         if not self.available():
             return None
         with self.lock:
@@ -960,15 +963,24 @@ class YoloMonsterDetector:
             try:
                 result = self.model.predict(img_bgr, conf=float(cfg.get("confidence", 0.45)),
                                             imgsz=int(cfg.get("imgsz", 960)), device=0,
-                                            classes=[0], verbose=False)[0]
+                                            verbose=False)[0]
             except Exception as e:
                 self.error = f"YOLO 偵測失敗：{e}"
                 return None
         out = []
-        for xyxy, conf in zip(result.boxes.xyxy.cpu().tolist(), result.boxes.conf.cpu().tolist()):
+        names = result.names or {}
+        for xyxy, conf, class_id in zip(result.boxes.xyxy.cpu().tolist(), result.boxes.conf.cpu().tolist(),
+                                        result.boxes.cls.cpu().tolist()):
+            name = str(names.get(int(class_id), class_id)).lower()
+            if wanted is not None and name != wanted:
+                continue
             x1, y1, x2, y2 = xyxy
-            out.append((int(round((x1 + x2) / 2)), int(round((y1 + y2) / 2)), float(conf), "YOLO怪物"))
+            out.append((int(round((x1 + x2) / 2)), int(round((y1 + y2) / 2)), float(conf), "YOLO_" + name))
         return out
+
+    def detect(self, img_bgr):
+        """相容舊的怪物偵測介面。"""
+        return self.detect_classes(img_bgr, "monster")
 
 
 class CombatScanner(threading.Thread):
@@ -3910,7 +3922,13 @@ class App:
         self.lbl_yolo_model = ttk.Label(runtime, text="", style="Hint.TLabel")
         self.lbl_yolo_model.pack(anchor="w", pady=(4, 0))
 
-        labels = section(f, "框選標註", "選一張圖片後按「標註怪物」，用滑鼠逐一框住怪物；可框多隻，Enter 儲存，Backspace 復原最後一框。")
+        labels = section(f, "框選標註", "選類別後框選圖片中的目標；同一張可先標怪物，再切換類別重開標註補道具、繩子或人物。Enter 儲存，Backspace 復原最後一框。")
+        category = ttk.Frame(labels)
+        category.pack(fill="x", pady=(0, 5))
+        ttk.Label(category, text="要標註：").pack(side="left")
+        self.var_yolo_label_class = tk.StringVar(value=YOLO_CLASS_LABELS[0])
+        ttk.Combobox(category, textvariable=self.var_yolo_label_class, values=YOLO_CLASS_LABELS,
+                     state="readonly", width=8).pack(side="left")
         body = ttk.Frame(labels)
         body.pack(fill="both", expand=True)
         self.lb_yolo_images = tk.Listbox(body, height=9, exportselection=False)
@@ -3918,7 +3936,7 @@ class App:
         side = ttk.Frame(body)
         side.pack(side="left", fill="y", padx=(8, 0))
         ttk.Button(side, text="重新整理", command=self.refresh_yolo_dataset).pack(fill="x")
-        ttk.Button(side, text="標註怪物", command=self.annotate_yolo_image).pack(fill="x", pady=(6, 0))
+        ttk.Button(side, text="開始框選", command=self.annotate_yolo_image).pack(fill="x", pady=(6, 0))
         ttk.Button(side, text="下一張未標註", command=self.select_next_yolo_unlabeled).pack(fill="x", pady=(6, 0))
         self.refresh_yolo_dataset()
         self.update_yolo_model_label()
@@ -3975,17 +3993,29 @@ class App:
         previous = self.selected_yolo_image()
         self.lb_yolo_images.delete(0, "end")
         labeled = 0
+        class_counts = [0] * len(YOLO_CLASS_NAMES)
         for name in names:
             stem = os.path.splitext(name)[0]
-            done = os.path.isfile(os.path.join(YOLO_LABELS_DIR, stem + ".txt"))
+            label_path = os.path.join(YOLO_LABELS_DIR, stem + ".txt")
+            done = os.path.isfile(label_path)
             labeled += int(done)
+            if done:
+                try:
+                    with open(label_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            fields = line.split()
+                            if len(fields) == 5 and fields[0].isdigit() and int(fields[0]) < len(class_counts):
+                                class_counts[int(fields[0])] += 1
+                except OSError:
+                    pass
             self.lb_yolo_images.insert("end", ("✓ " if done else "○ ") + name)
         if names:
             target = next((i for i, name in enumerate(names) if name == previous), 0)
             self.lb_yolo_images.selection_set(target)
             self.lb_yolo_images.see(target)
         state = "收集中" if self.yolo_collecting else "已停止"
-        self.lbl_yolo_dataset.config(text=f"{state}｜已收集 {len(names)} 張，已標註 {labeled} 張。資料只保存在本機 yolo_data 資料夾。")
+        details = "、".join(f"{YOLO_CLASS_LABELS[i]} {n}" for i, n in enumerate(class_counts))
+        self.lbl_yolo_dataset.config(text=f"{state}｜已收集 {len(names)} 張，已標註 {labeled} 張（{details}）。資料只保存在本機 yolo_data 資料夾。")
 
     def selected_yolo_image(self):
         if not hasattr(self, "lb_yolo_images"):
@@ -4062,11 +4092,13 @@ class App:
             self.notify("讀取圖片失敗。", error=True)
             return
         label_path = os.path.join(YOLO_LABELS_DIR, os.path.splitext(name)[0] + ".txt")
+        selected = self.var_yolo_label_class.get()
+        class_id = YOLO_CLASS_LABELS.index(selected) if selected in YOLO_CLASS_LABELS else 0
 
         def saved(count):
             self.refresh_yolo_dataset()
-            self.notify(f"已儲存 {count} 個怪物標註。")
-        YoloBoxAnnotator(self.root, img, label_path, saved)
+            self.notify(f"已儲存 {count} 個標註。")
+        YoloBoxAnnotator(self.root, img, label_path, class_id, saved)
 
     def open_yolo_dir(self):
         self._ensure_yolo_dirs()
@@ -4081,16 +4113,16 @@ class App:
         if not self.save_yolo_runtime():
             return
         t0 = time.time()
-        monsters = self.scanner.yolo.detect(img)
+        monsters = self.scanner.yolo.detect_classes(img)
         elapsed = (time.time() - t0) * 1000
         self.update_yolo_model_label()
         if monsters is None:
             self.notify(self.scanner.yolo.error or "YOLO 模型目前無法使用。", error=True)
             return
         out = img.copy()
-        for x, y, score, _name in monsters:
+        for x, y, score, name in monsters:
             cv2.circle(out, (x, y), 18, (255, 80, 0), 2)
-            cv2.putText(out, f"monster {score:.2f}", (x - 36, y - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+            cv2.putText(out, f"{name[5:]} {score:.2f}", (x - 36, y - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (255, 80, 0), 2, cv2.LINE_AA)
         win = tk.Toplevel(self.root)
         win.title(f"YOLO 偵測：{len(monsters)} 隻怪物（{elapsed:.0f} ms）")
@@ -5987,14 +6019,16 @@ class RectSelector(tk.Toplevel):
 
 
 class YoloBoxAnnotator(tk.Toplevel):
-    """簡化的 YOLO 標註器：單一類別「怪物」，可在同一張圖片框選多隻。"""
+    """簡化的 YOLO 標註器：可在同一張圖片標記多個類別。"""
 
-    def __init__(self, parent, img_bgr, label_path, callback):
+    def __init__(self, parent, img_bgr, label_path, class_id, callback):
         super().__init__(parent)
-        self.title("框選怪物：拖曳可新增多個框，Enter 儲存，Backspace 復原")
+        label = YOLO_CLASS_LABELS[class_id] if 0 <= class_id < len(YOLO_CLASS_LABELS) else "怪物"
+        self.title(f"框選{label}：拖曳可新增多個框，Enter 儲存，Backspace 復原")
         self.attributes("-topmost", True)
         self.img = img_bgr
         self.label_path = label_path
+        self.class_id = class_id
         self.callback = callback
         self.h, self.w = img_bgr.shape[:2]
         sw, sh = self.winfo_screenwidth() - 80, self.winfo_screenheight() - 180
@@ -6010,7 +6044,7 @@ class YoloBoxAnnotator(tk.Toplevel):
         self._draw_boxes()
         controls = ttk.Frame(self)
         controls.pack(fill="x", padx=6, pady=6)
-        ttk.Label(controls, text="類別：怪物").pack(side="left")
+        ttk.Label(controls, text=f"目前新增類別：{label}").pack(side="left")
         ttk.Button(controls, text="復原最後一框", command=self.undo).pack(side="right")
         ttk.Button(controls, text="儲存標註", command=self.save).pack(side="right", padx=(0, 6))
         self.cv.bind("<ButtonPress-1>", self.on_down)
@@ -6029,20 +6063,24 @@ class YoloBoxAnnotator(tk.Toplevel):
             with open(self.label_path, "r", encoding="utf-8") as f:
                 for line in f:
                     parts = line.split()
-                    if len(parts) != 5 or parts[0] != "0":
+                    if len(parts) != 5 or not parts[0].isdigit() or int(parts[0]) >= len(YOLO_CLASS_NAMES):
                         continue
+                    class_id = int(parts[0])
                     cx, cy, bw, bh = (float(v) for v in parts[1:])
                     w, h = bw * self.w, bh * self.h
-                    boxes.append((max(0, cx * self.w - w / 2), max(0, cy * self.h - h / 2), w, h))
+                    boxes.append((class_id, max(0, cx * self.w - w / 2), max(0, cy * self.h - h / 2), w, h))
         except (OSError, ValueError):
             pass
         return boxes
 
     def _draw_boxes(self):
         self.cv.delete("yolo_box")
-        for x, y, w, h in self.boxes:
+        for class_id, x, y, w, h in self.boxes:
+            color = YOLO_CLASS_COLORS[class_id] if class_id < len(YOLO_CLASS_COLORS) else "#ffffff"
             self.cv.create_rectangle(x * self.scale, y * self.scale, (x + w) * self.scale, (y + h) * self.scale,
-                                     outline="#00ff66", width=2, tags="yolo_box")
+                                     outline=color, width=2, tags="yolo_box")
+            self.cv.create_text(x * self.scale + 3, y * self.scale + 3,
+                                text=YOLO_CLASS_LABELS[class_id], fill=color, anchor="nw", tags="yolo_box")
 
     def on_down(self, event):
         self.start = (event.x, event.y)
@@ -6066,7 +6104,7 @@ class YoloBoxAnnotator(tk.Toplevel):
         if x1 - x0 < 4 or y1 - y0 < 4:
             return
         s = self.scale
-        self.boxes.append((x0 / s, y0 / s, (x1 - x0) / s, (y1 - y0) / s))
+        self.boxes.append((self.class_id, x0 / s, y0 / s, (x1 - x0) / s, (y1 - y0) / s))
         self._draw_boxes()
 
     def undo(self):
@@ -6077,12 +6115,12 @@ class YoloBoxAnnotator(tk.Toplevel):
     def save(self, _event=None):
         os.makedirs(os.path.dirname(self.label_path), exist_ok=True)
         lines = []
-        for x, y, w, h in self.boxes:
+        for class_id, x, y, w, h in self.boxes:
             x, y = max(0, min(x, self.w)), max(0, min(y, self.h))
             w, h = min(w, self.w - x), min(h, self.h - y)
             if w < 2 or h < 2:
                 continue
-            lines.append(f"0 {(x + w / 2) / self.w:.6f} {(y + h / 2) / self.h:.6f} {w / self.w:.6f} {h / self.h:.6f}")
+            lines.append(f"{class_id} {(x + w / 2) / self.w:.6f} {(y + h / 2) / self.h:.6f} {w / self.w:.6f} {h / self.h:.6f}")
         with open(self.label_path, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(lines) + ("\n" if lines else ""))
         self.callback(len(lines))

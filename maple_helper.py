@@ -47,7 +47,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v3.9.2"
+APP_VERSION = "v4.0.0"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -95,6 +95,12 @@ DEFAULT_CONFIG = {
     "hotkeys": {"toggle": "f10", "stop": "f12", "record": "f8"},
     "topmost": True,
     "yolo_dataset": {"interval_sec": 2.0},  # AI 資料收集的自動截圖間隔
+    "yolo": {
+        "enabled": True,
+        "model": "yolo_data/models/monster_current_map_v2.pt",
+        "confidence": 0.45,
+        "imgsz": 960,
+    },
     "lie_detector": {"enabled": True, "threshold": 0.8, "beep": True},
     "elite": {
         "enabled": False,
@@ -830,7 +836,7 @@ def find_rope_anchor(img_bgr, tag_tpl, anchor_gray, meta, search=320, thr=0.55):
     return x0 + loc[0] + int(meta["dx"]), cx, float(mx)
 
 
-def analyze_combat(img_bgr, cb, mon_tpls, tag_tpl):
+def analyze_combat(img_bgr, cb, mon_tpls, tag_tpl, yolo=None):
     """回傳 (角色畫面座標 or None, 怪物列表 [(x, y, score, name)])，座標為原始解析度"""
     s = float(cb.get("scale", 0.5))
     gray = _rescale(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY), s)
@@ -844,13 +850,17 @@ def analyze_combat(img_bgr, cb, mon_tpls, tag_tpl):
                 x, y = loc
                 tag_box = (x / s, y / s, t.shape[1] / s, t.shape[0] / s)
                 char = (int(tag_box[0] + tag_box[2] / 2), int(tag_box[1] + float(cb.get("char_offset_y", -35))))
-    mons = []
-    scaled = [(n, _rescale(t, s)) for n, t in mon_tpls]
-    for cx, cy, v, name in find_all(gray, scaled, float(cb.get("threshold", 0.7))):
-        X, Y = cx / s, cy / s
-        if tag_box and tag_box[0] - 10 <= X <= tag_box[0] + tag_box[2] + 10 and abs(Y - char[1]) < 40:
-            continue  # 排除角色自己
-        mons.append((int(X), int(Y), float(v), name))
+    # YOLO 成功載入時優先使用它；未安裝、模型不存在或偵測失敗才退回既有範本辨識。
+    mons = yolo.detect(img_bgr) if yolo is not None else None
+    if mons is None:
+        mons = []
+        scaled = [(n, _rescale(t, s)) for n, t in mon_tpls]
+        for cx, cy, v, name in find_all(gray, scaled, float(cb.get("threshold", 0.7))):
+            X, Y = cx / s, cy / s
+            mons.append((int(X), int(Y), float(v), name))
+    if tag_box and char:
+        mons = [(x, y, v, name) for x, y, v, name in mons
+                if not (tag_box[0] - 10 <= x <= tag_box[0] + tag_box[2] + 10 and abs(y - char[1]) < 40)]
     return char, mons
 
 
@@ -897,6 +907,70 @@ def analyze_items(img_bgr, loot, cb, item_tpls):
             for cx, cy, v, n in find_all(gray, scaled, float(loot.get("threshold", 0.75)), max_hits=60)]
 
 
+class YoloMonsterDetector:
+    """可選的 YOLO 怪物偵測器。延後載入，沒裝套件／沒有模型時不影響既有功能。"""
+
+    def __init__(self, app):
+        self.app = app
+        self.model = None
+        self.loaded_path = None
+        self.error = None
+        self.lock = threading.Lock()
+
+    def model_path(self):
+        raw = str(self.app.cfg.get("yolo", {}).get("model", "")).strip()
+        return raw if os.path.isabs(raw) else os.path.join(APP_DIR, raw)
+
+    def invalidate(self):
+        with self.lock:
+            self.model = None
+            self.loaded_path = None
+            self.error = None
+
+    def available(self):
+        cfg = self.app.cfg.get("yolo", {})
+        return bool(cfg.get("enabled") and os.path.isfile(self.model_path()))
+
+    def _load(self):
+        path = self.model_path()
+        if self.model is not None and self.loaded_path == path:
+            return True
+        if not os.path.isfile(path):
+            self.error = "找不到模型檔"
+            return False
+        try:
+            from ultralytics import YOLO
+            self.model = YOLO(path)
+            self.loaded_path = path
+            self.error = None
+            return True
+        except Exception as e:
+            self.model = None
+            self.error = f"YOLO 無法載入：{e}"
+            return False
+
+    def detect(self, img_bgr):
+        """成功時回傳怪物列表；模型未可用時回傳 None，讓呼叫端退回舊辨識。"""
+        if not self.available():
+            return None
+        with self.lock:
+            if not self._load():
+                return None
+            cfg = self.app.cfg.get("yolo", {})
+            try:
+                result = self.model.predict(img_bgr, conf=float(cfg.get("confidence", 0.45)),
+                                            imgsz=int(cfg.get("imgsz", 960)), device=0,
+                                            classes=[0], verbose=False)[0]
+            except Exception as e:
+                self.error = f"YOLO 偵測失敗：{e}"
+                return None
+        out = []
+        for xyxy, conf in zip(result.boxes.xyxy.cpu().tolist(), result.boxes.conf.cpu().tolist()):
+            x1, y1, x2, y2 = xyxy
+            out.append((int(round((x1 + x2) / 2)), int(round((y1 + y2) / 2)), float(conf), "YOLO怪物"))
+        return out
+
+
 class CombatScanner(threading.Thread):
     """背景掃描整個遊戲畫面，找角色名牌與怪物"""
 
@@ -911,6 +985,7 @@ class CombatScanner(threading.Thread):
         self.running = True
         self.ms = 0.0
         self.motion_gray = None
+        self.yolo = YoloMonsterDetector(app)
 
     def scan_ready(self):
         """有範本或啟用內部動態偵測時即可掃描。"""
@@ -946,7 +1021,7 @@ class CombatScanner(threading.Thread):
                 shot = sct.grab({"left": L, "top": T, "width": W, "height": H})
                 img = np.ascontiguousarray(np.array(shot)[:, :, :3])
                 char, mons = analyze_combat(img, cb, self.mon_templates if self.scan_ready() else [],
-                                            self.tag_template)
+                                            self.tag_template, self.yolo)
                 if char is not None:
                     self.last_char = (time.time(), char)
                 elif getattr(self, "last_char", None) and time.time() - self.last_char[0] < 2.0:
@@ -3818,6 +3893,23 @@ class App:
         self.lbl_yolo_dataset = ttk.Label(box, text="", style="Hint.TLabel")
         self.lbl_yolo_dataset.pack(anchor="w", pady=(5, 0))
 
+        runtime = section(f, "YOLO 怪物辨識", "這張地圖的模型會優先用於怪物辨識；沒有模型或 YOLO 環境時會保留舊範本辨識。全自動戰鬥仍維持關閉。")
+        yc = self.cfg.get("yolo", {})
+        self.var_yolo_enabled = tk.BooleanVar(value=yc.get("enabled", True))
+        self.var_yolo_conf = tk.StringVar(value=str(yc.get("confidence", 0.45)))
+        row2 = ttk.Frame(runtime)
+        row2.pack(fill="x")
+        ttk.Checkbutton(row2, text="啟用此地圖 YOLO 模型", variable=self.var_yolo_enabled,
+                        command=self.save_yolo_runtime).pack(side="left")
+        ttk.Label(row2, text="信心門檻").pack(side="left", padx=(14, 5))
+        entry_conf = ttk.Entry(row2, textvariable=self.var_yolo_conf, width=6)
+        entry_conf.pack(side="left")
+        entry_conf.bind("<FocusOut>", lambda _: self.save_yolo_runtime())
+        entry_conf.bind("<Return>", lambda _: self.save_yolo_runtime())
+        ttk.Button(row2, text="測試目前畫面", command=self.preview_yolo).pack(side="left", padx=(10, 0))
+        self.lbl_yolo_model = ttk.Label(runtime, text="", style="Hint.TLabel")
+        self.lbl_yolo_model.pack(anchor="w", pady=(4, 0))
+
         labels = section(f, "框選標註", "選一張圖片後按「標註怪物」，用滑鼠逐一框住怪物；可框多隻，Enter 儲存，Backspace 復原最後一框。")
         body = ttk.Frame(labels)
         body.pack(fill="both", expand=True)
@@ -3829,6 +3921,40 @@ class App:
         ttk.Button(side, text="標註怪物", command=self.annotate_yolo_image).pack(fill="x", pady=(6, 0))
         ttk.Button(side, text="下一張未標註", command=self.select_next_yolo_unlabeled).pack(fill="x", pady=(6, 0))
         self.refresh_yolo_dataset()
+        self.update_yolo_model_label()
+
+    def save_yolo_runtime(self):
+        try:
+            confidence = float(self.var_yolo_conf.get())
+            if not 0.05 <= confidence <= 0.95:
+                raise ValueError
+        except ValueError:
+            self.notify("YOLO 信心門檻請填 0.05～0.95", error=True)
+            return False
+        yc = self.cfg.setdefault("yolo", {})
+        yc["enabled"] = self.var_yolo_enabled.get()
+        yc["confidence"] = confidence
+        yc.setdefault("model", "yolo_data/models/monster_current_map_v2.pt")
+        yc.setdefault("imgsz", 960)
+        self.scanner.yolo.invalidate()
+        save_config(self.cfg)
+        self.update_yolo_model_label()
+        return True
+
+    def update_yolo_model_label(self):
+        if not hasattr(self, "lbl_yolo_model"):
+            return
+        detector = self.scanner.yolo
+        path = detector.model_path()
+        if not os.path.isfile(path):
+            text = "✘ 找不到模型：請先在此電腦完成訓練或放入模型檔。"
+        elif not self.cfg.get("yolo", {}).get("enabled", True):
+            text = "○ 模型已找到，目前未啟用。"
+        elif detector.error:
+            text = f"✘ {detector.error}"
+        else:
+            text = "✔ 已找到此地圖模型；按「測試目前畫面」可確認框選結果。"
+        self.lbl_yolo_model.config(text=text)
 
     def save_yolo_dataset_options(self):
         try:
@@ -3946,6 +4072,34 @@ class App:
         self._ensure_yolo_dirs()
         if IS_WIN:
             os.startfile(YOLO_DATA_DIR)
+
+    def preview_yolo(self):
+        img = self.vision.grab_client() if IS_WIN else None
+        if img is None:
+            self.notify("找不到遊戲視窗，無法測試 YOLO。", error=True)
+            return
+        if not self.save_yolo_runtime():
+            return
+        t0 = time.time()
+        monsters = self.scanner.yolo.detect(img)
+        elapsed = (time.time() - t0) * 1000
+        self.update_yolo_model_label()
+        if monsters is None:
+            self.notify(self.scanner.yolo.error or "YOLO 模型目前無法使用。", error=True)
+            return
+        out = img.copy()
+        for x, y, score, _name in monsters:
+            cv2.circle(out, (x, y), 18, (255, 80, 0), 2)
+            cv2.putText(out, f"monster {score:.2f}", (x - 36, y - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (255, 80, 0), 2, cv2.LINE_AA)
+        win = tk.Toplevel(self.root)
+        win.title(f"YOLO 偵測：{len(monsters)} 隻怪物（{elapsed:.0f} ms）")
+        win.attributes("-topmost", True)
+        scale = min(1.0, (self.root.winfo_screenwidth() - 80) / out.shape[1],
+                    (self.root.winfo_screenheight() - 120) / out.shape[0])
+        disp = cv2.resize(out, (int(out.shape[1] * scale), int(out.shape[0] * scale)))
+        win._image = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)))
+        tk.Label(win, image=win._image).pack()
 
     def build_skill(self, f):
         box = section(f, "Buff／定時技能", "每隔設定的秒數自動施放一次；按開始時，所有啟用的技能會先各放一次。雙擊可編輯。")
@@ -5712,6 +5866,9 @@ class App:
             payload = candidates[0]
             names = [n for n in ("maple_helper.py", "啟動.bat", "打包成exe.bat", "requirements.txt", "使用說明.md")
                      if os.path.isfile(os.path.join(payload, n))]
+            model_rel = os.path.join("yolo_data", "models", "monster_current_map_v2.pt")
+            if os.path.isfile(os.path.join(payload, model_rel)):
+                names.append(model_rel)
             if "maple_helper.py" not in names:
                 raise ValueError("更新檔不完整")
             self.ui(lambda: self.finish_update(payload, names))
@@ -5728,7 +5885,8 @@ class App:
             "import json,os,shutil,subprocess,sys,time;"
             "time.sleep(1.5);"
             "src,dst,py,entry,names=sys.argv[1:6];"
-            "[shutil.copy2(os.path.join(src,n),os.path.join(dst,n)) for n in json.loads(names) "
+            "[(os.makedirs(os.path.dirname(os.path.join(dst,n)),exist_ok=True),"
+            "shutil.copy2(os.path.join(src,n),os.path.join(dst,n))) for n in json.loads(names) "
             "if os.path.isfile(os.path.join(src,n))];"
             "subprocess.Popen([py,entry],cwd=dst)"
         )

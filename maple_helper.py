@@ -28,7 +28,7 @@ import traceback
 import urllib.error
 import urllib.request
 import zipfile
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox, simpledialog, filedialog
 
 import numpy as np
 import cv2
@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.3"
+APP_VERSION = "v4.1.4"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -192,6 +192,10 @@ ROPE_DIR = os.path.join(TEMPLATE_DIR, "ropes")
 YOLO_DATA_DIR = os.path.join(APP_DIR, "yolo_data")
 YOLO_IMAGES_DIR = os.path.join(YOLO_DATA_DIR, "images")
 YOLO_LABELS_DIR = os.path.join(YOLO_DATA_DIR, "labels")
+YOLO_INBOX_DIR = os.path.join(YOLO_DATA_DIR, "把圖片丟這裡")          # 使用者自己截的圖丟進來，一鍵匯入
+YOLO_AUTO_LIST = os.path.join(YOLO_DATA_DIR, "auto_labeled.txt")     # 模型自動標註、還沒人工確認的圖片
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm")
 YOLO_CLASS_NAMES = ("monster", "item", "rope", "player")
 YOLO_CLASS_LABELS = ("怪物", "道具", "繩子", "人物")
 YOLO_CLASS_COLORS = ("#00ff66", "#ff4fd8", "#ffb000", "#00d9ff")
@@ -201,7 +205,7 @@ BUILTIN_MODEL = {
     "file": "monster_current_map_v2.pt",
     "version": "map_multiclass_v4",
     "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
-    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.3/monster_current_map_v2.pt",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.4/monster_current_map_v2.pt",
 }
 
 
@@ -4596,6 +4600,14 @@ class App:
         self.btn_yolo_collect.pack(side="left")
         ttk.Button(row, text="立即截圖", command=self.capture_yolo_image).pack(side="left", padx=(6, 0))
         ttk.Button(row, text="開啟資料夾", command=self.open_yolo_dir).pack(side="left", padx=(6, 0))
+        row_b = ttk.Frame(box)
+        row_b.pack(fill="x", pady=(6, 0))
+        ttk.Button(row_b, text="匯入「把圖片丟這裡」", command=self.import_yolo_inbox).pack(side="left")
+        ttk.Button(row_b, text="開啟該資料夾", command=self.open_yolo_inbox).pack(side="left", padx=(6, 0))
+        ttk.Button(row_b, text="從影片擷取…", command=self.import_yolo_video).pack(side="left", padx=(6, 0))
+        hint(box, "更快的收集方式：① 用任何截圖工具截好的圖（png／jpg）丟進「把圖片丟這裡」資料夾，按匯入；"
+                  "② 用 OBS／顯示卡錄一段遊戲影片，按「從影片擷取」每隔幾秒取一張，畫面幾乎沒變的會自動略過。"
+                  "重複的圖片不會匯入兩次。", pady=(4, 0))
         self.lbl_yolo_dataset = ttk.Label(box, text="", style="Hint.TLabel")
         self.lbl_yolo_dataset.pack(anchor="w", pady=(5, 0))
 
@@ -4627,7 +4639,9 @@ class App:
         self.lbl_yolo_model = ttk.Label(runtime, text="", style="Hint.TLabel")
         self.lbl_yolo_model.pack(anchor="w", pady=(4, 0))
 
-        labels = section(f, "框選標註", "選類別後框選圖片中的目標；同一張可先標怪物，再切換類別重開標註補道具、繩子或人物。Enter 儲存，Backspace 復原最後一框。")
+        labels = section(f, "框選標註", "選類別後框選圖片中的目標；同一張可先標怪物，再切換類別重開標註補道具、繩子或人物。"
+                                       "Enter 儲存，Backspace 復原最後一框，在框上按右鍵刪除那一框。"
+                                       "「用模型自動標註」會先幫沒標過的圖畫好框（清單顯示 ◐），你只要打開檢查、刪掉錯的、補上漏的再存檔。")
         category = ttk.Frame(labels)
         category.pack(fill="x", pady=(0, 5))
         ttk.Label(category, text="要標註：").pack(side="left")
@@ -4643,6 +4657,8 @@ class App:
         ttk.Button(side, text="重新整理", command=self.refresh_yolo_dataset).pack(fill="x")
         ttk.Button(side, text="開始框選", command=self.annotate_yolo_image).pack(fill="x", pady=(6, 0))
         ttk.Button(side, text="下一張未標註", command=self.select_next_yolo_unlabeled).pack(fill="x", pady=(6, 0))
+        ttk.Button(side, text="用模型自動標註", command=self.auto_label_yolo).pack(fill="x", pady=(12, 0))
+        ttk.Button(side, text="下一張待確認", command=self.select_next_yolo_auto).pack(fill="x", pady=(6, 0))
         self.refresh_yolo_dataset()
         self.update_yolo_model_label()
 
@@ -4760,6 +4776,7 @@ class App:
             return
         names = self._yolo_image_files()
         previous = self.selected_yolo_image()
+        auto = self._yolo_auto_set()
         self.lb_yolo_images.delete(0, "end")
         labeled = 0
         class_counts = [0] * len(YOLO_CLASS_NAMES)
@@ -4777,14 +4794,18 @@ class App:
                                 class_counts[int(fields[0])] += 1
                 except OSError:
                     pass
-            self.lb_yolo_images.insert("end", ("✓ " if done else "○ ") + name)
+            mark = ("◐ " if name in auto else "✓ ") if done else "○ "
+            self.lb_yolo_images.insert("end", mark + name)
         if names:
             target = next((i for i, name in enumerate(names) if name == previous), 0)
             self.lb_yolo_images.selection_set(target)
             self.lb_yolo_images.see(target)
         state = "收集中" if self.yolo_collecting else "已停止"
         details = "、".join(f"{YOLO_CLASS_LABELS[i]} {n}" for i, n in enumerate(class_counts))
-        self.lbl_yolo_dataset.config(text=f"{state}｜已收集 {len(names)} 張，已標註 {labeled} 張（{details}）。資料只保存在本機 yolo_data 資料夾。")
+        pending = sum(1 for n in names if n in auto)
+        self.lbl_yolo_dataset.config(text=f"{state}｜已收集 {len(names)} 張，已標註 {labeled} 張（{details}）"
+                                     + (f"，其中 {pending} 張是自動標註待確認" if pending else "")
+                                     + "。資料只保存在本機 yolo_data 資料夾。")
 
     def selected_yolo_image(self):
         if not hasattr(self, "lb_yolo_images"):
@@ -4865,9 +4886,215 @@ class App:
         class_id = YOLO_CLASS_LABELS.index(selected) if selected in YOLO_CLASS_LABELS else 0
 
         def saved(count):
+            auto = self._yolo_auto_set()
+            if name in auto:                       # 人工確認過了
+                auto.discard(name)
+                self._save_yolo_auto_set(auto)
             self.refresh_yolo_dataset()
             self.notify(f"已儲存 {count} 個標註。")
         YoloBoxAnnotator(self.root, img, label_path, class_id, saved)
+
+    # ---- 自動標註清單 ----
+    def _yolo_auto_set(self):
+        try:
+            with open(YOLO_AUTO_LIST, "r", encoding="utf-8") as f:
+                return {ln.strip() for ln in f if ln.strip()}
+        except OSError:
+            return set()
+
+    def _save_yolo_auto_set(self, names):
+        try:
+            with open(YOLO_AUTO_LIST, "w", encoding="utf-8") as f:
+                f.write("".join(n + "\n" for n in sorted(names)))
+        except OSError as e:
+            log(f"儲存自動標註清單失敗：{e}", "warn")
+
+    def select_next_yolo_auto(self):
+        auto = self._yolo_auto_set()
+        names = self._yolo_image_files()
+        for i, name in enumerate(names):
+            if name in auto:
+                self.lb_yolo_images.selection_clear(0, "end")
+                self.lb_yolo_images.selection_set(i)
+                self.lb_yolo_images.see(i)
+                return
+        self.notify("沒有待確認的自動標註圖片。")
+
+    # ---- 匯入圖片／影片 ----
+    def open_yolo_inbox(self):
+        os.makedirs(YOLO_INBOX_DIR, exist_ok=True)
+        if IS_WIN:
+            os.startfile(YOLO_INBOX_DIR)
+        else:
+            self.notify(f"匯入資料夾：{YOLO_INBOX_DIR}")
+
+    def _save_dataset_image(self, img, prefix, known):
+        """存成 yolo_data/images 的 png；內容一樣的圖（雜湊相同）不重複存。回傳是否新增"""
+        ok, buf = cv2.imencode(".png", img)
+        if not ok:
+            return False
+        digest = hashlib.sha1(buf.tobytes()).hexdigest()[:16]
+        if digest in known:
+            return False
+        known.add(digest)
+        path = os.path.join(YOLO_IMAGES_DIR, f"{prefix}_{digest}.png")
+        with open(path, "wb") as f:
+            f.write(buf.tobytes())
+        return True
+
+    def _known_image_digests(self):
+        out = set()
+        for n in self._yolo_image_files():
+            m = re.search(r"_([0-9a-f]{16})\.png$", n)
+            if m:
+                out.add(m.group(1))
+        return out
+
+    def import_yolo_inbox(self):
+        """匯入「把圖片丟這裡」裡的所有圖片（含子資料夾）；匯入完的原檔移到「已匯入」"""
+        os.makedirs(YOLO_INBOX_DIR, exist_ok=True)
+        done_dir = os.path.join(YOLO_INBOX_DIR, "已匯入")
+        files = []
+        for base, dirs, names in os.walk(YOLO_INBOX_DIR):
+            if os.path.abspath(base).startswith(os.path.abspath(done_dir)):
+                continue
+            files += [os.path.join(base, n) for n in names if n.lower().endswith(IMAGE_EXTS)]
+        if not files:
+            self.notify("「把圖片丟這裡」資料夾是空的：先把截圖（png／jpg）放進去再按匯入。")
+            self.open_yolo_inbox()
+            return
+        self.notify(f"正在匯入 {len(files)} 張圖片…")
+
+        def worker():
+            self._ensure_yolo_dirs()
+            os.makedirs(done_dir, exist_ok=True)
+            known = self._known_image_digests()
+            added = dup = bad = 0
+            for path in files:
+                img = imread_unicode(path)
+                if img is None:
+                    bad += 1
+                    continue
+                if img.ndim == 3 and img.shape[2] == 4:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                if self._save_dataset_image(img, "import", known):
+                    added += 1
+                else:
+                    dup += 1
+                try:
+                    target = os.path.join(done_dir, os.path.basename(path))
+                    if os.path.exists(target):
+                        stem, ext = os.path.splitext(target)
+                        target = f"{stem}_{time.time_ns() % 1_000_000:06d}{ext}"
+                    shutil.move(path, target)
+                except OSError:
+                    pass
+            msg = f"匯入完成：新增 {added} 張" + (f"，重複略過 {dup} 張" if dup else "") + \
+                  (f"，無法讀取 {bad} 張" if bad else "") + "。原檔已移到「已匯入」。"
+            self.ui(lambda: (self.refresh_yolo_dataset(), self.notify(msg)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def import_yolo_video(self):
+        """從遊戲錄影每隔幾秒擷取一張；和上一張幾乎一樣的畫面略過"""
+        path = filedialog.askopenfilename(parent=self.root, title="選擇遊戲錄影",
+                                          filetypes=[("影片", " ".join("*" + e for e in VIDEO_EXTS)), ("全部檔案", "*.*")])
+        if not path:
+            return
+        d = FormDialog(self.root, "從影片擷取", [("sec", "每隔幾秒取一張", "1.0"), ("max", "最多幾張", "300")])
+        if not d.result:
+            return
+        try:
+            every, limit = max(0.2, float(d.result["sec"])), max(1, int(d.result["max"]))
+        except ValueError:
+            self.notify("秒數與張數請填數字。", error=True)
+            return
+        self.notify(f"正在從影片擷取：{os.path.basename(path)}…")
+
+        def worker():
+            self._ensure_yolo_dirs()
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                self.ui(lambda: self.notify("無法開啟這個影片檔（格式不支援或檔案損毀）。", error=True))
+                return
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            step = max(1, int(round(fps * every)))
+            known = self._known_image_digests()
+            added = skipped = idx = 0
+            last_small = None
+            while added < limit:
+                ok = cap.grab()
+                if not ok:
+                    break
+                if idx % step == 0:
+                    ok, frame = cap.retrieve()
+                    if ok and frame is not None:
+                        small = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (160, 90))
+                        if last_small is not None and float(cv2.absdiff(small, last_small).mean()) < 2.5:
+                            skipped += 1               # 和上一張幾乎一樣（站著不動、選單畫面）
+                        else:
+                            last_small = small
+                            if self._save_dataset_image(frame, "video", known):
+                                added += 1
+                                if added % 25 == 0:
+                                    n = added
+                                    self.ui(lambda: self.notify(f"影片擷取中…已存 {n} 張"))
+                idx += 1
+            cap.release()
+            msg = f"影片擷取完成：新增 {added} 張" + (f"，畫面太像略過 {skipped} 張" if skipped else "") + "。"
+            self.ui(lambda: (self.refresh_yolo_dataset(), self.notify(msg)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---- 模型自動標註 ----
+    def auto_label_yolo(self):
+        """用目前的模型替「還沒標註」的圖片先畫好框（之後人工檢查），標成 ◐ 待確認"""
+        det = self.scanner.yolo
+        if not det.available():
+            self.notify("目前沒有可用的 YOLO 模型（或未啟用），無法自動標註。", error=True)
+            return
+        names = [n for n in self._yolo_image_files()
+                 if not os.path.isfile(os.path.join(YOLO_LABELS_DIR, os.path.splitext(n)[0] + ".txt"))]
+        if not names:
+            self.notify("所有圖片都已經有標註了。")
+            return
+        if not messagebox.askyesno("用模型自動標註", f"要用目前的模型替 {len(names)} 張還沒標註的圖片先畫框嗎？\n"
+                                   "畫好的圖會標成 ◐（待確認），請再逐張打開檢查。", parent=self.root):
+            return
+        self.notify(f"自動標註中（{len(names)} 張）…")
+
+        def worker():
+            auto = self._yolo_auto_set()
+            done = boxes_total = 0
+            for i, name in enumerate(names):
+                img = imread_unicode(os.path.join(YOLO_IMAGES_DIR, name))
+                if img is None:
+                    continue
+                boxes = det.detect_boxes(img)
+                if boxes is None:
+                    err = det.error or "模型無法使用"
+                    self.ui(lambda: self.notify(f"自動標註中斷：{err}", error=True))
+                    break
+                h, w = img.shape[:2]
+                lines = []
+                for x1, y1, x2, y2, conf, cls in boxes:
+                    if cls not in YOLO_CLASS_NAMES:
+                        continue
+                    bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+                    lines.append(f"{YOLO_CLASS_NAMES.index(cls)} {(x1 + bw / 2) / w:.6f} {(y1 + bh / 2) / h:.6f} "
+                                 f"{bw / w:.6f} {bh / h:.6f}")
+                with open(os.path.join(YOLO_LABELS_DIR, os.path.splitext(name)[0] + ".txt"), "w",
+                          encoding="utf-8", newline="\n") as f:
+                    f.write("\n".join(lines) + ("\n" if lines else ""))
+                auto.add(name)
+                done += 1
+                boxes_total += len(lines)
+                if done % 20 == 0:
+                    self._save_yolo_auto_set(auto)
+                    n = done
+                    self.ui(lambda: (self.refresh_yolo_dataset(), self.notify(f"自動標註中…{n}/{len(names)}")))
+            self._save_yolo_auto_set(auto)
+            msg = f"自動標註完成：{done} 張、共 {boxes_total} 個框；清單中 ◐ 的圖請逐張檢查後存檔。"
+            self.ui(lambda: (self.refresh_yolo_dataset(), self.notify(msg)))
+        threading.Thread(target=worker, daemon=True).start()
 
     def open_yolo_dir(self):
         self._ensure_yolo_dirs()
@@ -6953,6 +7180,7 @@ class YoloBoxAnnotator(tk.Toplevel):
         self.cv.bind("<ButtonPress-1>", self.on_down)
         self.cv.bind("<B1-Motion>", self.on_drag)
         self.cv.bind("<ButtonRelease-1>", self.on_up)
+        self.cv.bind("<Button-3>", self.on_right_click)
         self.bind("<Return>", self.save)
         self.bind("<BackSpace>", lambda _: self.undo())
         self.bind("<Escape>", lambda _: self.destroy())
@@ -7013,6 +7241,15 @@ class YoloBoxAnnotator(tk.Toplevel):
     def undo(self):
         if self.boxes:
             self.boxes.pop()
+            self._draw_boxes()
+
+    def on_right_click(self, event):
+        """右鍵：刪除游標所在的框（重疊時刪最小的那個）"""
+        x, y = event.x / self.scale, event.y / self.scale
+        hits = [(w * h, i) for i, (_c, bx, by, w, h) in enumerate(self.boxes)
+                if bx <= x <= bx + w and by <= y <= by + h]
+        if hits:
+            del self.boxes[min(hits)[1]]
             self._draw_boxes()
 
     def save(self, _event=None):

@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.2"
+APP_VERSION = "v4.1.3"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -75,8 +75,9 @@ DEFAULT_CONFIG = {
     "keys": {"jump": "alt", "attack": "ctrl", "left": "left", "right": "right",
              "up": "up", "down": "down"},
     "attack": {"enabled": False, "interval": 0.6},
-    "buff_start_wait": 1.0,
-    "rope_prehold": True,     # 快走到繩子時先按住上（不用跳的繩子），到繩下馬上抓住   # 開始時放完全部 Buff 後，再等幾秒才開始移動（等最後一個 Buff 動作結束）
+    "buff_start_wait": 1.0,   # 開始時放完全部 Buff 後，再等幾秒才開始移動（等最後一個 Buff 動作結束）
+    "rope_prehold": True,     # 快走到繩子時先按住上（不用跳的繩子），到繩下馬上抓住
+    "rope_prehold_dist": 4,   # 距離繩子幾格（小地圖 px）內開始先按住上
     "skills": [
         {"name": "Buff 範例", "key": "home", "interval": 180, "enabled": False, "delay": 0.8},
     ],
@@ -107,7 +108,6 @@ DEFAULT_CONFIG = {
         "imgsz": 960,
         # 路線爬繩時，先用畫面上的 YOLO 繩子框做最後對位；沒有結果會自動退回原本的小地圖／微調流程。
         "rope_assist": True,
-        "rope_dx": None,       # 角色站在抓得到繩子的位置時，YOLO 繩子中心 − 角色中心（自動學習；還沒學到就不用 YOLO 推位置）
         # 各類別信心門檻（低於門檻的框不採用）；道具與繩子的信心通常比怪物、人物低
         "class_conf": {"monster": 0.45, "item": 0.35, "rope": 0.25, "player": 0.45},
     },
@@ -195,6 +195,24 @@ YOLO_LABELS_DIR = os.path.join(YOLO_DATA_DIR, "labels")
 YOLO_CLASS_NAMES = ("monster", "item", "rope", "player")
 YOLO_CLASS_LABELS = ("怪物", "道具", "繩子", "人物")
 YOLO_CLASS_COLORS = ("#00ff66", "#ff4fd8", "#ffb000", "#00d9ff")
+# 內建 YOLO 模型（怪物／道具／繩子／人物四類）。一鍵更新不會覆蓋已存在的模型檔（可能是自己訓練的），
+# 所以模型另外用這組資訊檢查與下載：SHA-256 不同且缺少繩子／道具類別時，會詢問是否更新（舊檔備份成 .bak）。
+BUILTIN_MODEL = {
+    "file": "monster_current_map_v2.pt",
+    "version": "map_multiclass_v4",
+    "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.3/monster_current_map_v2.pt",
+}
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 YOLO_CLASS_CONF_DEFAULT = {"monster": 0.45, "item": 0.35, "rope": 0.25, "player": 0.45}
 
 
@@ -1107,6 +1125,11 @@ class YoloMonsterDetector:
             else:
                 self.device = int(want) if want.isdigit() else want
             log(f"YOLO 模型已載入（{os.path.basename(path)}，{'GPU' if self.device == 0 else 'CPU'}）")
+            missing = {"item", "rope"} - self.class_names[path]
+            if missing and hasattr(self.app, "offer_model_update"):
+                label = "、".join(YOLO_CLASS_LABELS[YOLO_CLASS_NAMES.index(k)] for k in sorted(missing))
+                log(f"目前的 YOLO 模型沒有{label}類別（較舊的模型）", "warn")
+                self.app.ui(lambda: self.app.offer_model_update(f"目前的模型沒有{label}類別，繩子對位與道具辨識不會生效。"))
             return True
         except Exception as e:
             self.model = None
@@ -2084,15 +2107,15 @@ class Bot(threading.Thread):
         delta = int(rope[0] - char[0])
         return delta if abs(delta) <= max_distance else None
 
-    def learn_rope_dx(self, rope, delta):
-        """角色確定站在抓得到繩子的位置時呼叫：記下這條繩子的 YOLO 偏移，並更新全域平均"""
-        if delta is None:
+    def learn_rope_dx(self, rope, delta, save=True):
+        """角色確定站在抓得到繩子的位置時呼叫：只記在這一根繩子上（不同繩子不互相影響），1.5 秒後自動存檔"""
+        if delta is None or rope is None:
             return
-        if rope is not None:
+        if rope.get("yolo_dx") != int(delta):
             rope["yolo_dx"] = int(delta)
-        yc = self.cfg.setdefault("yolo", {})
-        old = yc.get("rope_dx")
-        yc["rope_dx"] = int(round(delta if old in (None, 0) else 0.7 * float(old) + 0.3 * delta))
+            log(f"學到繩子 X={rope.get('x')} 的 YOLO 偏移 {int(delta):+d} px")
+            if save and hasattr(self.app, "schedule_save"):
+                self.app.ui(self.app.schedule_save)
 
     def yolo_align_rope(self, max_distance=180, rope=None):
         """依畫面辨識到的繩子做最後水平對位。
@@ -2105,9 +2128,9 @@ class Bot(threading.Thread):
         if measured is None:
             return False
         # 角色抓得到繩子時，名牌中心和 YOLO 繩子中心本來就有固定偏移；對到「學到的偏移」而不是 0
-        target = (rope or {}).get("yolo_dx", self.cfg.get("yolo", {}).get("rope_dx"))
+        target = (rope or {}).get("yolo_dx")
         if target is None:
-            # 還不知道「抓得到繩子時」的偏移：不要用 YOLO 硬推到繩子正中間（名牌中心和繩子中心本來就有差）
+            # 這根繩子還沒學到「抓得到時」的偏移：不用 YOLO 推位置（名牌中心和繩子中心本來就有差，也不借用別根繩子的值）
             return False
         target = int(target)
         delta = int(measured - target)
@@ -2202,11 +2225,16 @@ class Bot(threading.Thread):
         self.last_climb_land = None
         up = self.key("up")
         prehold = up if (not jump_to_grab and self.cfg.get("rope_prehold", True)) else None
+        prehold_dist = max(1, int(self.cfg.get("rope_prehold_dist", 4)))
         for attempt in range(attempts):
             p0 = None
             try:
-                if not self.goto(rope_x, tol=self.cfg["rope_tolerance"], prehold=prehold):
+                if not self.goto(rope_x, tol=self.cfg["rope_tolerance"], prehold=prehold,
+                                 prehold_dist=prehold_dist):
                     continue
+                if prehold:
+                    log(f"爬繩 X={rope_x}：" + ("接近時已提前抓到繩子" if self.early_grab
+                                                else f"接近時（{prehold_dist} 格內按住上）沒抓到，改用對位後抓繩"))
                 if self.early_grab:                       # 走過去時已經抓到繩子
                     p0 = (rope_x, self._prehold_y0)
                 else:
@@ -3566,7 +3594,7 @@ class App:
         h = min(px(700), wh - 40)
         root.geometry(f"{w}x{h}+{wl + max(0, ww - w - 20)}+{wt + 10}")
         root.minsize(min(px(720), ww - 20), min(px(480), wh - 40))
-        root.attributes("-topmost", self.cfg.get("topmost", True))
+        root.attributes("-topmost", False)          # 一律不置頂開啟，避免蓋住遊戲
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._base_tk_scaling = float(root.tk.call("tk", "scaling"))
         self._ui_ratio = None
@@ -3645,6 +3673,7 @@ class App:
         self.refresh()
         self.poll_hotkeys()
         self.root.after(1200, self.check_for_updates)
+        self.root.after(3000, self.check_model_present)
         # 啟動時只看存檔的設定（遊戲視窗、角色點要等辨識跑起來才知道）
         if self.missing_required(skip=("game", "dot")):
             self.nb.select(self.tab_setup)
@@ -4479,6 +4508,7 @@ class App:
         ttk.Checkbutton(adv.body, text="繩子也可以當隨機目標（爬上去）", variable=self.var_rope_target,
                         command=self.save_patrol_opt).pack(anchor="w")
         ttk.Button(adv.body, text="重設繩子落點（地圖改了或落點記錯時）", command=self.reset_lands).pack(anchor="w", pady=(4, 0))
+        ttk.Button(adv.body, text="重設所有繩子的 YOLO 偏移（之後會重新學）", command=self.reset_rope_dx).pack(anchor="w", pady=(4, 0))
         self.reload_patrol()
         return f
 
@@ -4582,6 +4612,7 @@ class App:
         ttk.Checkbutton(row2, text="爬繩時畫面對位", variable=self.var_yolo_rope_assist,
                         command=self.save_yolo_runtime).pack(side="left", padx=(10, 0))
         ttk.Button(row2, text="測試目前畫面", command=self.preview_yolo).pack(side="left", padx=(10, 0))
+        ttk.Button(row2, text="更新內建模型", command=self.update_builtin_model).pack(side="left", padx=(6, 0))
         row3 = ttk.Frame(runtime)
         row3.pack(fill="x", pady=(4, 0))
         ttk.Label(row3, text="信心門檻").pack(side="left", padx=(0, 6))
@@ -4635,6 +4666,65 @@ class App:
         self.update_yolo_model_label()
         return True
 
+    def offer_model_update(self, reason):
+        """詢問是否更新成內建模型（每次開啟只問一次）"""
+        if getattr(self, "_model_offer_done", False) or not self.alive_ui:
+            return
+        self._model_offer_done = True
+        if messagebox.askyesno("更新 YOLO 模型", f"{reason}\n\n要下載內建的四類模型（怪物／道具／繩子／人物）嗎？\n"
+                               "原本的模型會備份成 .bak 檔。", parent=self.root):
+            self.update_builtin_model()
+
+    def update_builtin_model(self):
+        """下載內建模型、比對 SHA-256，舊模型備份後換上；在背景執行"""
+        dest = os.path.join(YOLO_DATA_DIR, "models", BUILTIN_MODEL["file"])
+        try:
+            if os.path.isfile(dest) and file_sha256(dest) == BUILTIN_MODEL["sha256"]:
+                self.notify(f"已經是最新的內建模型（{BUILTIN_MODEL['version']}）。")
+                return
+        except OSError:
+            pass
+        self.notify("正在下載內建 YOLO 模型…")
+
+        def worker():
+            tmp = dest + ".download"
+            try:
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                req = urllib.request.Request(BUILTIN_MODEL["url"], headers={"User-Agent": f"MapleHelper/{APP_VERSION}"})
+                with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as out:
+                    shutil.copyfileobj(r, out)
+                if file_sha256(tmp) != BUILTIN_MODEL["sha256"]:
+                    raise ValueError("模型檔校驗碼不符（下載不完整），已取消")
+                backup = ""
+                if os.path.isfile(dest):
+                    backup = dest + time.strftime(".bak-%Y%m%d-%H%M%S")
+                    os.replace(dest, backup)
+                os.replace(tmp, dest)
+                yc = self.cfg.setdefault("yolo", {})
+                yc["model"] = "yolo_data/models/" + BUILTIN_MODEL["file"]
+                self.scanner.yolo.invalidate()
+                save_config(self.cfg)
+                msg = f"已更新內建 YOLO 模型（{BUILTIN_MODEL['version']}）" + (
+                    f"，舊模型備份為 {os.path.basename(backup)}" if backup else "")
+                self.ui(lambda: (self.notify(msg), self.update_yolo_model_label()))
+            except Exception as e:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                err = f"下載內建模型失敗：{e}"
+                log_exception("下載內建模型失敗", e)
+                self.ui(lambda: self.notify(err, error=True))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def check_model_present(self):
+        """開啟時：YOLO 已啟用但模型檔不在（例如新電腦），詢問是否下載內建模型"""
+        yc = self.cfg.get("yolo", {})
+        path = self.scanner.yolo.model_path()
+        if yc.get("enabled", True) and not os.path.isfile(path) \
+                and os.path.basename(path) == BUILTIN_MODEL["file"]:
+            self.offer_model_update("這台電腦還沒有 YOLO 模型檔。")
+
     def update_yolo_model_label(self):
         if not hasattr(self, "lbl_yolo_model"):
             return
@@ -4648,6 +4738,9 @@ class App:
             text = f"✘ {detector.error}"
         else:
             text = "✔ 已找到此地圖模型；按「測試目前畫面」可確認框選結果。"
+            names = detector.class_names.get(path)
+            if names is not None and not {"item", "rope"} <= names:
+                text = "△ 這個模型沒有道具／繩子類別（較舊的模型），可按「更新內建模型」。"
         self.lbl_yolo_model.config(text=text)
 
     def save_yolo_dataset_options(self):
@@ -5004,10 +5097,10 @@ class App:
     def build_options(self, f):
         box2 = section(f, "基礎")
         self.var_focus = tk.BooleanVar(value=self.cfg.get("only_when_focused", True))
-        self.var_top = tk.BooleanVar(value=self.cfg.get("topmost", True))
+        self.var_top = tk.BooleanVar(value=False)
         ttk.Checkbutton(box2, text="只在遊戲視窗為前景時送出按鍵（建議開啟）", variable=self.var_focus,
                         command=self.save_settings).pack(anchor="w", pady=(4, 0))
-        ttk.Checkbutton(box2, text="本工具視窗置頂", variable=self.var_top,
+        ttk.Checkbutton(box2, text="暫時置頂（開始掛機或重開後自動取消）", variable=self.var_top,
                         command=self.save_settings).pack(anchor="w")
         self.var_key_repeat = tk.BooleanVar(value=self.cfg.get("key_repeat", True))
         ttk.Checkbutton(box2, text="按住的鍵持續送出訊號（像實體鍵盤按住）",
@@ -5019,8 +5112,16 @@ class App:
         ttk.Checkbutton(box2, text="暫停／停止時自動還原本工具視窗", variable=self.var_restore,
                         command=self.save_settings).pack(anchor="w")
         self.var_prehold = tk.BooleanVar(value=self.cfg.get("rope_prehold", True))
-        ttk.Checkbutton(box2, text="接近繩子時先按住上（不用跳的繩子）", variable=self.var_prehold,
-                        command=self.save_settings).pack(anchor="w")
+        pre = ttk.Frame(box2)
+        pre.pack(anchor="w", fill="x")
+        ttk.Checkbutton(pre, text="接近繩子時先按住上，距離", variable=self.var_prehold,
+                        command=self.save_settings).pack(side="left")
+        self.var_prehold_dist = tk.StringVar(value=str(self.cfg.get("rope_prehold_dist", 4)))
+        e = ttk.Entry(pre, textvariable=self.var_prehold_dist, width=3)
+        e.pack(side="left", padx=3)
+        e.bind("<FocusOut>", lambda _e: self.save_settings())
+        e.bind("<Return>", lambda _e: self.save_settings())
+        ttk.Label(pre, text="格內").pack(side="left")
         hint(box2, "開始／暫停熱鍵只在遊戲或本工具在前景時有效；緊急停止隨時有效。", pady=(4, 0))
 
     def open_diag_dir(self):
@@ -5763,8 +5864,8 @@ class App:
                 img = None
         if img is None:
             return "（擷取不到遊戲畫面）"
-        try:   # 角色正站在抓得到繩子的位置：記下 YOLO 繩子偏移（有模型時）
-            self.bot.learn_rope_dx(rope, self.bot.yolo_rope_delta(img))
+        try:   # 角色正站在抓得到繩子的位置：記下這根繩子的 YOLO 偏移（有模型時；呼叫端會存檔）
+            self.bot.learn_rope_dx(rope, self.bot.yolo_rope_delta(img), save=False)
         except Exception as e:
             log(f"記錄 YOLO 繩子偏移失敗：{e}", "warn")
         crop, meta = make_rope_anchor(img, self.scanner.tag_template)
@@ -5847,6 +5948,29 @@ class App:
             self.bot.last_target = None
             save_config(self.cfg)
             self.reload_patrol()
+
+    def reset_rope_dx(self):
+        n = 0
+        for t in self.cfg["patrol"]:
+            if t.pop("yolo_dx", None) is not None:
+                n += 1
+        self.cfg.get("yolo", {}).pop("rope_dx", None)
+        save_config(self.cfg)
+        self.reload_patrol()
+        self.notify(f"已重設 {n} 條繩子的 YOLO 偏移；之後精準對位成功或重新記錄時會再學。")
+
+    def schedule_save(self, delay_ms=1500):
+        """背景學到新資料時呼叫：合併 1.5 秒內的多次變更，只存一次檔"""
+        if getattr(self, "_save_job", None):
+            try:
+                self.root.after_cancel(self._save_job)
+            except tk.TclError:
+                pass
+
+        def go():
+            self._save_job = None
+            save_config(self.cfg)
+        self._save_job = self.root.after(delay_ms, go)
 
     def reset_lands(self):
         for t in self.cfg["patrol"]:
@@ -5970,14 +6094,21 @@ class App:
             self.vision.hwnd = None
         self.cfg.update(new)
         self.cfg["only_when_focused"] = self.var_focus.get()
-        self.cfg["topmost"] = self.var_top.get()
+        self.cfg["topmost"] = False              # 置頂只是暫時的，不寫進設定
         self.cfg["minimize_on_start"] = self.var_min_start.get()
         self.cfg["key_repeat"] = self.var_key_repeat.get()
         self.kb.repeat = self.cfg["key_repeat"]
         self.cfg["restore_on_pause"] = self.var_restore.get()
         if hasattr(self, "var_prehold"):
             self.cfg["rope_prehold"] = self.var_prehold.get()
-        self.root.attributes("-topmost", self.cfg["topmost"])
+            try:
+                d = int(self.var_prehold_dist.get())
+                if not 1 <= d <= 20:
+                    raise ValueError
+                self.cfg["rope_prehold_dist"] = d
+            except ValueError:
+                self.notify("先按住上的距離請填 1～20 格", error=True)
+        self.root.attributes("-topmost", bool(self.var_top.get()))
         save_config(self.cfg)
 
     def test_jump(self):
@@ -6517,7 +6648,10 @@ class App:
         self.notify("已清除全部隨機路線。")
 
     def _after_start(self):
-        """開始後：縮小本工具、把遊戲切到前景"""
+        """開始後：取消暫時置頂、縮小本工具、把遊戲切到前景"""
+        if getattr(self, "var_top", None) is not None and self.var_top.get():
+            self.var_top.set(False)
+            self.root.attributes("-topmost", False)
         if not self.cfg.get("minimize_on_start", True):
             return
         self.root.iconify()
@@ -6627,13 +6761,6 @@ class App:
         if notes:
             text += "\n\n更新內容：\n" + notes[:700]
         log(f"發現新版 {tag}")
-        if getattr(sys, "frozen", False):   # 打包成 exe 的版本無法直接覆寫原始碼，改開下載頁
-            if messagebox.askyesno("有新版本", f"發現新版 {tag}（目前 {APP_VERSION}）。\n\n"
-                                   "執行檔版本無法自動更新，要開啟下載頁嗎？下載後重新執行「打包成exe.bat」。",
-                                   parent=self.root):
-                import webbrowser
-                webbrowser.open(release.get("html_url") or f"https://github.com/{UPDATE_REPOSITORY}/releases/latest")
-            return
         if messagebox.askyesno("有新版本", text, parent=self.root):
             threading.Thread(target=self.download_and_apply_update, args=(asset,), daemon=True).start()
 
@@ -6690,19 +6817,14 @@ class App:
         log(f"套用更新：{', '.join(names)}")
         # 不使用 .cmd：cmd 對中文資料夾／檔名的編碼常會變成亂碼。
         # 以 Unicode 參數直接啟動短暫的 Python 更新助手，保留使用者的設定與地圖資料。
-        helper = (
-            "import json,os,shutil,subprocess,sys,time;"
-            "time.sleep(1.5);"
-            "src,dst,py,entry,names=sys.argv[1:6];"
-            "[(os.makedirs(os.path.dirname(os.path.join(dst,n)),exist_ok=True),"
-            "shutil.copy2(os.path.join(src,n),os.path.join(dst,n))) for n in json.loads(names) "
-            "if os.path.isfile(os.path.join(src,n)) and not (n.startswith('yolo_data') "
-            "and os.path.exists(os.path.join(dst,n)))];"
-            "subprocess.Popen([py,entry],cwd=dst)"
-        )
-        subprocess.Popen([sys.executable, "-c", helper, payload, APP_DIR, sys.executable,
-                          os.path.join(APP_DIR, "maple_helper.py"), json.dumps(names, ensure_ascii=False)],
-                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        # 由本程式自己的「--apply-update」模式當更新助手（Python 版與 EXE 版都適用）：
+        # 等本視窗關閉 → 複製新檔 → 重新開啟。EXE 版會在啟動時改跑資料夾內較新的 maple_helper.py。
+        args = ["--apply-update", payload, APP_DIR, json.dumps(names, ensure_ascii=False)]
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable] + args
+        else:
+            cmd = [sys.executable, os.path.abspath(__file__)] + args
+        subprocess.Popen(cmd, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.root.after(300, self.on_close)
 
     def on_close(self):
@@ -6940,7 +7062,66 @@ class ColorPicker(tk.Toplevel):
         self.destroy()
 
 
+def apply_update_cli(argv):
+    """更新助手：python maple_helper.py --apply-update <來源> <目的> <檔名清單JSON>（EXE 版同參數）。
+    等舊視窗關閉後複製新檔（已存在的 yolo_data 模型不覆蓋），再重新開啟工具。"""
+    src, dst, names = argv[0], argv[1], json.loads(argv[2])
+    time.sleep(1.5)
+    copied = []
+    for n in names:
+        s_path, d_path = os.path.join(src, n), os.path.join(dst, n)
+        if not os.path.isfile(s_path) or (n.startswith("yolo_data") and os.path.exists(d_path)):
+            continue
+        for _ in range(10):          # 舊程式可能還沒完全結束：最多重試 5 秒
+            try:
+                os.makedirs(os.path.dirname(d_path), exist_ok=True)
+                shutil.copy2(s_path, d_path)
+                copied.append(n)
+                break
+            except OSError:
+                time.sleep(0.5)
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(os.path.join(LOG_DIR, time.strftime("%Y-%m-%d") + ".log"), "a", encoding="utf-8") as f:
+            f.write(f"{EventLog.stamp()} 更新助手：已複製 {', '.join(copied) or '（無）'}\n")
+    except OSError:
+        pass
+    if getattr(sys, "frozen", False):
+        subprocess.Popen([sys.executable], cwd=dst)
+    else:
+        subprocess.Popen([sys.executable, os.path.join(dst, "maple_helper.py")], cwd=dst)
+
+
+def run_newer_source():
+    """EXE 版：資料夾裡有比執行檔內建版本更新的 maple_helper.py（一鍵更新下載的）就改跑它。
+    執行檔已內含所有套件，新的原始碼可以直接用；載入失敗時退回內建版本。回傳是否已執行新版。"""
+    if not getattr(sys, "frozen", False) or os.environ.get("MAPLE_HELPER_SOURCE"):
+        return False
+    path = os.path.join(APP_DIR, "maple_helper.py")
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            head = f.read(20000)
+    except OSError:
+        return False
+    m = re.search(r'^APP_VERSION = "([^"]+)"', head, re.M)
+    if not m or version_key(m.group(1)) <= version_key(APP_VERSION):
+        return False
+    os.environ["MAPLE_HELPER_SOURCE"] = path
+    try:
+        import runpy
+        runpy.run_path(path, run_name="__main__")
+        return True
+    except (ImportError, SyntaxError) as e:
+        log(f"執行新版原始碼失敗，改用執行檔內建的 {APP_VERSION}：{e}", "error")
+        return False
+
+
 def main():
+    if len(sys.argv) >= 5 and sys.argv[1] == "--apply-update":
+        apply_update_cli(sys.argv[2:5])
+        return
+    if run_newer_source():
+        return
     if not IS_WIN:
         print("此工具僅支援 Windows。")
         return

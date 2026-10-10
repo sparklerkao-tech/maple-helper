@@ -206,7 +206,7 @@ BUILTIN_MODEL = {
     "file": "monster_current_map_v2.pt",
     "version": "map_multiclass_v4",
     "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
-    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.4/monster_current_map_v2.pt",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.5/monster_current_map_v2.pt",
 }
 
 

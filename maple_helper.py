@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.4"
+APP_VERSION = "v4.1.5"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -147,6 +147,7 @@ DEFAULT_CONFIG = {
     },
     "loot": {
         "key": "z",             # 撿物鍵
+        "enabled": True,        # 撿物總開關；關閉時 BUFF 機只移動（不連點、不走去撿、不掃地）
         "auto_tap": True,       # BUFF機模式下持續連點撿物鍵
         "tap_interval": 0.12,
         "threshold": 0.7,       # 物品範本相似度門檻
@@ -1244,7 +1245,8 @@ class CombatScanner(threading.Thread):
             cb = self.app.cfg["combat"]
             v = self.app.vision
             active = self.app.bot.active.is_set() or time.time() < self.force_until
-            want_loot = self.app.cfg.get("mode") == "buff" and self.loot_ready()
+            want_loot = (self.app.cfg.get("mode") == "buff" and self.app.cfg["loot"].get("enabled", True)
+                         and self.loot_ready())
             if not (sct and (self.scan_ready() or want_loot) and active and v.hwnd and v.rect):
                 self.motion_gray = None
                 time.sleep(0.2)
@@ -2611,6 +2613,45 @@ class Bot(threading.Thread):
             self.app.ui(self.app.reload_patrol)
         return ok
 
+    def rope_pairs(self):
+        """有設定「繩上定點」的繩子＝一組（繩下點＋繩上點）"""
+        return [i for i, t in enumerate(self.cfg["patrol"]) if t.get("type") == "rope" and t.get("top")]
+
+    def pair_patrol_once(self):
+        """BUFF 機：隨機挑一組繩子 → 走到繩下 → 爬上去 → 走到繩上定點 → 停一下（不攻擊）"""
+        pairs = self.rope_pairs()
+        cands = [i for i in pairs if i != self.last_target] or pairs
+        i = random.choice(cands)
+        r = self.cfg["patrol"][i]
+        n = pairs.index(i) + 1
+        self.last_target = i
+        self.app.highlight_patrol(i)
+        tx, ty = int(r["top"][0]), int(r["top"][1])
+        self.status = f"繩組 {n}：前往繩下 ({r['x']},{r['y']})"
+        if not self.navigate(int(r["x"]), int(r["y"])):
+            self.nav_fail += 1
+            self.status = f"繩組 {n}：到不了繩下，換下一組"
+            log(self.status, "warn")
+            if self.nav_fail >= 5:
+                self.app.trigger_alarm("stuck", "BUFF機連續 5 次到不了繩組，可能卡住了", pause=True, beep=True)
+                self.nav_fail = 0
+            return
+        self.status = f"繩組 {n}：爬繩"
+        if not self.climb_and_learn(r):
+            self.nav_fail += 1
+            self.status = f"繩組 {n}：沒爬上去，換下一組"
+            log(self.status, "warn")
+            return
+        self.status = f"繩組 {n}：走到繩上定點 ({tx},{ty})"
+        p = self.pos()
+        ok = self.navigate(tx, ty) if (p is None or abs(p[1] - ty) > int(self.popt("plat_tol"))) \
+            else self.goto(tx)
+        self.nav_fail = 0 if ok else self.nav_fail + 1
+        self.sweep()
+        lo, hi = sorted((float(self.popt("stay_min")), float(self.popt("stay_max"))))
+        self.status = f"繩組 {n}：到達，停留"
+        self.sleep(random.uniform(lo, hi))
+
     def patrol_once(self, attack=True):
         pts = self.cfg["patrol"]
         cands = [i for i, t in enumerate(pts)
@@ -2622,7 +2663,8 @@ class Bot(threading.Thread):
         t = pts[i]
         self.last_target = i
         self.app.highlight_patrol(i)
-        self.status = f"隨機目標 #{i + 1}：{'攻擊點' if t['type'] == 'point' else '繩子'} ({t['x']},{t['y']})"
+        kind = ("巡邏點" if not attack else "攻擊點") if t["type"] == "point" else "繩子"
+        self.status = f"隨機目標 #{i + 1}：{kind} ({t['x']},{t['y']})"
         jit = int(self.popt("x_jitter")) if t["type"] == "point" else 0
         tx = int(t["x"]) + random.randint(-jit, jit)
         if not self.navigate(tx, int(t["y"])):
@@ -2662,7 +2704,8 @@ class Bot(threading.Thread):
         """BUFF機模式下持續連點撿物鍵（爬繩時不按）"""
         while self.alive:
             lt = self.cfg["loot"]
-            ok = (self.active.is_set() and self.cfg.get("mode") == "buff" and lt.get("auto_tap", True)
+            ok = (self.active.is_set() and self.cfg.get("mode") == "buff" and lt.get("enabled", True)
+                  and lt.get("auto_tap", True)
                   and lt.get("key") and not self.climbing and self.app.alarm_kind != "lie")
             if ok and self.cfg.get("only_when_focused") and IS_WIN and not is_foreground(self.app.vision.hwnd):
                 ok = False
@@ -2705,7 +2748,7 @@ class Bot(threading.Thread):
     def loot_targets(self):
         """回傳 (角色座標, [(dx, x, y), ...])：同一層、範圍內、沒被放棄的物品"""
         sc = self.app.scanner
-        if not sc.loot_ready():
+        if not self.cfg["loot"].get("enabled", True) or not sc.loot_ready():
             return None, []
         snap = sc.snap
         if not snap or len(snap) < 4 or time.time() - snap[0] > 1.0 or snap[1] is None:
@@ -2795,7 +2838,7 @@ class Bot(threading.Thread):
     def sweep(self):
         """在原地左右掃一小段，補撿沒辨識到的物品"""
         sec = float(self.cfg["loot"].get("sweep_sec", 0.5))
-        if sec <= 0:
+        if sec <= 0 or not self.cfg["loot"].get("enabled", True):
             return
         first = random.choice(("left", "right"))
         second = "left" if first == "right" else "right"
@@ -3205,10 +3248,12 @@ class Bot(threading.Thread):
                         self.play_macro(map_macro, align=False, suppress_loot=True, allow_buffs=True)
                     elif self.loot_targets()[1]:
                         self.loot_items()
+                    elif self.rope_pairs():
+                        self.pair_patrol_once()          # 有繩組：只在繩組之間移動
                     elif self.cfg["patrol"]:
                         self.patrol_once(attack=False)
                     else:
-                        self.status = "BUFF機：沒有巡邏點，原地放 Buff＋掃地"
+                        self.status = "BUFF機：沒有繩組或巡邏點，原地放 Buff"
                         self.tick_skills()
                         self.sweep()
                         self.sleep(1.0)
@@ -3399,7 +3444,7 @@ C_WARN = "#b26a00"
 
 MODE_INFO = {
     "anchor": ("◎ 定點掛機", "站在定點按住範圍技，定時換點；不爬繩，被撞開會在同一層走回定點 X。"),
-    "buff": ("✚ BUFF機", "依整張地圖的錄製路徑循環移動、放 Buff、撿物，不自動攻擊。"),
+    "buff": ("✚ BUFF機", "只移動不攻擊：照錄製路線或在繩組之間移動、放 Buff；撿物可開關。"),
 }
 MODE_ORDER = ["anchor", "buff"]
 
@@ -4231,6 +4276,8 @@ class App:
                 if key in self.cfg["loot"]:
                     var.set(str(self.cfg["loot"][key]))
             self.var_loot_tap.set(self.cfg["loot"].get("auto_tap", True))
+            if hasattr(self, "var_loot_on"):
+                self.var_loot_on.set(self.cfg["loot"].get("enabled", True))
         if hasattr(self, "var_map_play_mode"):
             opts = self.cfg.get("map_macro_options", {})
             self.var_map_play_mode.set(opts.get("play_mode", "record"))
@@ -4310,8 +4357,9 @@ class App:
         if mode == "buff":                    # 定點掛機不爬繩，不顯示繩下定點區
             self.pn_patrol.pack(fill="x")
         if mode == "buff":
-            self.lbl_patrol_hint.config(text="站在繩子正下方按「＋ 繩下定點」記錄繩子位置；爬不穩就改用「● 錄製爬繩」親手爬一次。"
-                                             "沒有錄製全圖路線時，BUFF 機會在巡邏點與繩子之間隨機移動。")
+            self.lbl_patrol_hint.config(text="一組＝「繩下定點」＋「繩上定點」：站在繩子正下方按「＋ 繩下定點」，爬上去走到要停的位置，"
+                                             "按「＋ 繩上定點」（會配給清單選取的繩子，沒選就配給最後記錄的繩子）。"
+                                             "沒有錄製全圖路線時，BUFF 機只在這些繩組之間隨機移動：走到繩下 → 爬上去 → 走到繩上定點，不攻擊。")
             if not self.btn_rec_point.winfo_manager():
                 self.btn_rec_point.pack(side="left", padx=(0, 6), before=self.btn_rec_rope)
         else:
@@ -4442,6 +4490,9 @@ class App:
         lt = self.cfg["loot"]
         box = section(f, "撿物", "移動時會一直連點撿物鍵；框選物品範本後，看到地上的物品會走過去撿。Buff 在「共用設定」設定。")
         self.loot_vars = {}
+        self.var_loot_on = tk.BooleanVar(value=lt.get("enabled", True))
+        ttk.Checkbutton(box, text="啟用撿物（取消＝BUFF 機只移動、放 Buff）", variable=self.var_loot_on,
+                        command=self.save_loot).pack(anchor="w", pady=(0, 4))
         g = ttk.Frame(box)
         g.pack(fill="x")
         form_grid(g, [("key", "撿物鍵", KEY_SPEC), ("sweep_sec", "到點掃地秒數(0=不掃)")], lt, self.loot_vars,
@@ -4495,6 +4546,8 @@ class App:
         self.btn_rec_rope.pack(side="left", padx=(0, 6))
         ttk.Button(r, text="● 錄製爬繩", command=self.record_rope_macro).pack(side="left", padx=(0, 6))
         ttk.Button(r, text="● 錄製跳台", command=self.record_jump_macro).pack(side="left")
+        self.btn_rec_top = ttk.Button(r, text="＋ 繩上定點", command=self.record_rope_top)
+        self.btn_rec_top.pack(side="left", padx=(6, 0), after=self.btn_rec_rope)
         r2 = ttk.Frame(self.patrol_box)
         r2.pack(fill="x", pady=(4, 0))
         ttk.Button(r2, text="校準精準位置", command=self.calibrate_rope).pack(side="left", padx=(0, 6))
@@ -5655,6 +5708,10 @@ class App:
                 if t["type"] == "rope":
                     top = t.get("lands_y", t["y"] - 15) * scale
                     self.canvas.create_line(x, y, x, top, fill="#ff9800", width=2)
+                    if t.get("top"):
+                        tx_, ty_ = ox + t["top"][0] * scale, t["top"][1] * scale
+                        self.canvas.create_line(x, top, tx_, ty_, fill="#69f0ae", dash=(3, 2))
+                        self.canvas.create_oval(tx_ - 4, ty_ - 4, tx_ + 4, ty_ + 4, outline="#69f0ae", width=2)
                 elif mode != "anchor":
                     self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4, outline="#4caf50", width=2)
                     self.canvas.create_text(x + 7, y - 7, text=str(i + 1), fill="white", font=("Arial", 8))
@@ -6064,13 +6121,15 @@ class App:
                 info = (f"{climb}；落在 Y={t['lands_y']}" if t.get("lands_y") is not None
                         else f"{climb}；尚未爬過（第一次會自動記住）")
                 info = ("◎精準 " if t.get("screen_anchor") else "△未校準 ") + info
+                if t.get("top"):
+                    info = f"繩組｜繩上定點 ({t['top'][0]},{t['top'][1]})；" + info
             elif t["type"] == "jump":
                 end = (t.get("macro") or {}).get("end") or ["?", "?"]
                 info = ("◎精準 " if t.get("screen_anchor") else "△未校準 ") + \
                     f"跳到 ({end[0]},{end[1]})；● 錄製動作（{macro_summary(t.get('macro'))}）"
             else:
-                info = "隨機攻擊、停留"
-            kind = {"rope": "繩子", "jump": "跳台"}.get(t["type"], "攻擊點")
+                info = "停留（BUFF 機有繩組時不使用）" if self.cfg.get("mode") == "buff" else "隨機攻擊、停留"
+            kind = {"rope": "繩組" if t.get("top") else "繩子", "jump": "跳台"}.get(t["type"], "巡邏點")
             self.tv_patrol.insert("", "end", iid=str(i), values=(i + 1, kind, t["x"], t["y"], info))
 
     def highlight_patrol(self, i):
@@ -6126,6 +6185,32 @@ class App:
         if typ == "rope":
             self.notify(f"已記錄繩子 #{len(self.cfg['patrol'])}（X={p[0]} Y={p[1]}）{extra}",
                         error="無法" in extra or "沒有" in extra)
+
+    def record_rope_top(self):
+        """記錄「繩上定點」，和選取的（或最後記錄的）繩子配成一組"""
+        p = self.vision.get_pos()
+        if not p:
+            self.notify("目前偵測不到角色座標，請先框選小地圖並確認取色。", error=True)
+            return
+        idx = self.sel_index(self.tv_patrol)
+        ropes = [i for i, t in enumerate(self.cfg["patrol"]) if t.get("type") == "rope"]
+        if idx is None or self.cfg["patrol"][idx].get("type") != "rope":
+            if not ropes:
+                self.notify("請先站在繩子下方按「＋ 繩下定點」，再爬上去按「＋ 繩上定點」。", error=True)
+                return
+            idx = ropes[-1]
+        r = self.cfg["patrol"][idx]
+        tol = int(self.cfg["patrol_opt"]["plat_tol"])
+        if p[1] >= r["y"] - tol:
+            self.notify(f"繩上定點要在繩子上面那一層（繩下 Y={r['y']}，目前 Y={p[1]}）；請先爬上去再按。", error=True)
+            return
+        r["top"] = [p[0], p[1]]
+        if r.get("lands_y") is None:
+            r["lands_y"] = p[1]
+        save_config(self.cfg)
+        self.reload_patrol()
+        self.tv_patrol.selection_set(str(idx))
+        self.notify(f"繩組 #{idx + 1}：繩下 ({r['x']},{r['y']}) ↔ 繩上 ({p[0]},{p[1]})")
 
     def calibrate_rope(self):
         """角色站在「按↑就抓得到繩子」的位置時，重新記下所選繩子的精準位置"""
@@ -6595,6 +6680,9 @@ class App:
             self.notify(str(e), error=True)
             return
         lt["auto_tap"] = self.var_loot_tap.get()
+        if hasattr(self, "var_loot_on") and lt.get("enabled", True) != self.var_loot_on.get():
+            lt["enabled"] = self.var_loot_on.get()
+            log("撿物：" + ("開啟" if lt["enabled"] else "關閉（BUFF 機只移動）"))
         save_config(self.cfg)
 
     def set_nametag_loot(self):

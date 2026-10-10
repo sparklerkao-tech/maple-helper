@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.6"
+APP_VERSION = "v4.1.7"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -206,7 +206,7 @@ BUILTIN_MODEL = {
     "file": "monster_current_map_v2.pt",
     "version": "map_multiclass_v4",
     "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
-    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.6/monster_current_map_v2.pt",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.7/monster_current_map_v2.pt",
 }
 
 
@@ -218,6 +218,8 @@ def file_sha256(path):
     return h.hexdigest()
 
 
+ROPE_DX_MAX = 40      # 抓得到繩子時，名牌中心與 YOLO 繩子中心最多差幾 px（超過就是量錯）
+ALIGN_MAX_PX = 50     # 走到小地圖位置後，畫面對位最多修正幾 px；更遠表示對到別條繩子
 YOLO_CLASS_CONF_DEFAULT = {"monster": 0.45, "item": 0.35, "rope": 0.25, "player": 0.45}
 
 
@@ -1991,6 +1993,20 @@ class Bot(threading.Thread):
                     if p[1] <= self._prehold_y0 - 2:      # 已經抓到繩子往上爬了
                         self.early_grab = True
                         return True
+                if abs(dx) <= tol and prehold and prehold in self.kb.held:
+                    # 已在繩下且按住上：站著按住上本來就會抓住，等一下看看有沒有開始往上爬
+                    if cur_dir:
+                        self.kb.up(cur_dir)
+                        cur_dir = None
+                    end_wait = time.time() + 0.35
+                    while time.time() < end_wait:
+                        self.check()
+                        q = self.pos()
+                        if q and q[1] <= self._prehold_y0 - 2:
+                            self.early_grab = True
+                            return True
+                        time.sleep(0.03)
+                    return True
                 if abs(dx) <= tol:
                     if cur_dir:   # 到點：放開，等角色停穩再確認一次
                         self.kb.up(cur_dir)
@@ -2080,6 +2096,10 @@ class Bot(threading.Thread):
                 return False
             want, cx, score = r
             d = want - cx
+            if abs(d) > ALIGN_MAX_PX:
+                self.status = f"精準對位：差 {d:+d} px 太遠，可能對到旁邊的繩子，改用小地圖位置"
+                log(self.status, "warn")
+                return False
             self.status = f"精準對位：差 {d:+d} px"
             if abs(d) <= 3:
                 return True
@@ -2094,7 +2114,7 @@ class Bot(threading.Thread):
         self._px_time = px_time
         return False
 
-    def yolo_rope_delta(self, img=None, max_distance=180):
+    def yolo_rope_delta(self, img=None, max_distance=120):
         """畫面上最近的繩子中心 − 角色中心（px）；找不到回傳 None"""
         yolo_cfg = self.cfg.get("yolo", {})
         detector = self.app.scanner.yolo
@@ -2117,6 +2137,10 @@ class Bot(threading.Thread):
         """角色確定站在抓得到繩子的位置時呼叫：只記在這一根繩子上（不同繩子不互相影響），1.5 秒後自動存檔"""
         if delta is None or rope is None:
             return
+        if abs(int(delta)) > ROPE_DX_MAX:
+            # 角色站在抓得到繩子的位置時，名牌和繩子不會差這麼多：多半是 YOLO 沒看到腳下的繩子、量到旁邊那條
+            log(f"繩子 X={rope.get('x')} 的 YOLO 偏移 {int(delta):+d} px 不合理，不採用（可能量到旁邊的繩子）", "warn")
+            return
         if rope.get("yolo_dx") != int(delta):
             rope["yolo_dx"] = int(delta)
             log(f"學到繩子 X={rope.get('x')} 的 YOLO 偏移 {int(delta):+d} px")
@@ -2135,11 +2159,18 @@ class Bot(threading.Thread):
             return False
         # 角色抓得到繩子時，名牌中心和 YOLO 繩子中心本來就有固定偏移；對到「學到的偏移」而不是 0
         target = (rope or {}).get("yolo_dx")
+        if target is not None and abs(int(target)) > ROPE_DX_MAX:
+            rope.pop("yolo_dx", None)          # 舊版學到的不合理偏移：丟掉，之後重新學
+            target = None
         if target is None:
             # 這根繩子還沒學到「抓得到時」的偏移：不用 YOLO 推位置（名牌中心和繩子中心本來就有差，也不借用別根繩子的值）
             return False
         target = int(target)
         delta = int(measured - target)
+        if abs(delta) > ALIGN_MAX_PX:
+            self.status = f"YOLO 繩子對位：差 {delta:+d} px 太遠，可能看到別條繩子，不採用"
+            log(self.status, "warn")
+            return False
         if abs(delta) <= 6:
             self.status = "YOLO 繩子對位完成"
             return True

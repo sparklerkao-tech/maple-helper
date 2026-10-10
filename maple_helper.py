@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.5"
+APP_VERSION = "v4.1.6"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -206,7 +206,7 @@ BUILTIN_MODEL = {
     "file": "monster_current_map_v2.pt",
     "version": "map_multiclass_v4",
     "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
-    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.5/monster_current_map_v2.pt",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.6/monster_current_map_v2.pt",
 }
 
 
@@ -2388,6 +2388,29 @@ class Bot(threading.Thread):
             time.sleep(0.03)
         return last_y - p0[1] > self.popt("plat_tol")
 
+    def drop_at(self, r):
+        """走到下跳點下跳；第一次跳會記住落在哪一層（之後找路會優先用下跳點，比下繩快）"""
+        tol = int(self.popt("plat_tol"))
+        self.status = f"前往下跳點 X={r['x']}"
+        if not self.goto(int(r["x"])):
+            return False
+        self.kb.release_all()
+        self.quiet_wait(0.1)
+        p0 = self.pos()
+        ok = self.down_jump_move()
+        p = self.wait_landed()
+        if ok and p and p0 and p[1] > p0[1] + tol:
+            if r.get("lands_y") != p[1]:
+                r["lands_y"] = p[1]
+                log(f"下跳點 X={r['x']}：落在 Y={p[1]}")
+                if hasattr(self.app, "schedule_save"):
+                    self.app.ui(self.app.schedule_save)
+                self.app.ui(self.app.reload_patrol)
+            return True
+        self.status = f"下跳點 X={r['x']}：沒有往下掉（下面可能沒有平台）"
+        log(self.status, "warn")
+        return False
+
     # ---- 找路：繩子（上／下）與跳台當成「通道」，規劃最短路線 ----
     def nav_links(self):
         tol = int(self.popt("plat_tol"))
@@ -2401,6 +2424,9 @@ class Bot(threading.Thread):
                 if ly is not None and ly < r["y"] - tol:
                     links.append({"kind": "up", "sx": sx, "sy": r["y"], "ex": sx, "ey": ly, "ref": r})
                     links.append({"kind": "down", "sx": sx, "sy": ly, "ex": sx, "ey": r["y"], "ref": r})
+            elif t == "drop" and r.get("lands_y") is not None and r["lands_y"] > r["y"] + tol:
+                links.append({"kind": "drop", "sx": int(r["x"]), "sy": int(r["y"]), "ex": int(r["x"]),
+                              "ey": int(r["lands_y"]), "ref": r})
             elif t == "jump" and mac and mac.get("start") and mac.get("end"):
                 links.append({"kind": "jump", "sx": int(mac["start"][0]), "sy": int(mac["start"][1]),
                               "ex": int(mac["end"][0]), "ey": int(mac["end"][1]), "ref": r})
@@ -2430,7 +2456,7 @@ class Bot(threading.Thread):
             for l in links:
                 if abs(l["sy"] - y) > tol or (l in path):
                     continue
-                c = cost + abs(x - l["sx"]) * WALK + (1.2 if l["kind"] == "jump" else 1.0)
+                c = cost + abs(x - l["sx"]) * WALK + {"jump": 1.2, "drop": 0.6, "down": 1.6}.get(l["kind"], 1.0)   # 往下優先下跳點，其次下繩
                 nxt = (l["ex"], l["ey"])
                 if c < best.get(nxt, 1e9):
                     best[nxt] = c
@@ -2445,6 +2471,8 @@ class Bot(threading.Thread):
             return self.climb_and_learn(r)
         if l["kind"] == "down":
             return self.climb_down(l["sx"], l["ey"], rope=r)
+        if l["kind"] == "drop":
+            return self.drop_at(r)
         # 跳台：重播錄製的跳躍，確認落在錄製時的位置
         self.status = f"跳台：({l['sx']},{l['sy']}) → ({l['ex']},{l['ey']})"
         self.play_macro(r["macro"], anchor=r.get("screen_anchor"))
@@ -2465,10 +2493,19 @@ class Bot(threading.Thread):
             cx, cy = p
             if abs(cy - ty) <= tol:
                 return self.goto(tx)
+            if ty > cy + tol:   # 要往下：本層有還沒跳過的下跳點，先用它（學到落點後，之後找路就會優先走下跳）
+                drops = [r for r in self.cfg["patrol"] if r.get("type") == "drop" and abs(r["y"] - cy) <= tol
+                         and r.get("lands_y") is None and id(r) not in banned]
+                if drops:
+                    r = min(drops, key=lambda r: abs(r["x"] - cx))
+                    if not self.drop_at(r):
+                        banned.add(id(r))
+                        fails += 1
+                    continue
             path = self.plan_path(cx, cy, tx, ty, banned)
             if path:
                 l = path[0]
-                self.status = f"路線：還有 {len(path)} 段（下一段：{ {'up': '上繩', 'down': '下繩', 'jump': '跳台'}[l['kind']] }）"
+                self.status = f"路線：還有 {len(path)} 段（下一段：{ {'up': '上繩', 'down': '下繩', 'jump': '跳台', 'drop': '下跳'}[l['kind']] }）"
                 if self.run_link(l):
                     continue
                 fails += 1
@@ -2647,7 +2684,7 @@ class Bot(threading.Thread):
         ok = self.navigate(tx, ty) if (p is None or abs(p[1] - ty) > int(self.popt("plat_tol"))) \
             else self.goto(tx)
         self.nav_fail = 0 if ok else self.nav_fail + 1
-        self.sweep()
+        self.kb.release_all()                 # 到點就停住，不左右掃
         lo, hi = sorted((float(self.popt("stay_min")), float(self.popt("stay_max"))))
         self.status = f"繩組 {n}：到達，停留"
         self.sleep(random.uniform(lo, hi))
@@ -4359,7 +4396,8 @@ class App:
         if mode == "buff":
             self.lbl_patrol_hint.config(text="一組＝「繩下定點」＋「繩上定點」：站在繩子正下方按「＋ 繩下定點」，爬上去走到要停的位置，"
                                              "按「＋ 繩上定點」（會配給清單選取的繩子，沒選就配給最後記錄的繩子）。"
-                                             "沒有錄製全圖路線時，BUFF 機只在這些繩組之間隨機移動：走到繩下 → 爬上去 → 走到繩上定點，不攻擊。")
+                                             "沒有錄製全圖路線時，BUFF 機只在這些繩組之間隨機移動：走到繩下 → 爬上去 → 走到繩上定點，不攻擊。"
+                                             "要往下層時，有「下跳點」就優先在那裡下跳（比沿繩子爬下來快）。")
             if not self.btn_rec_point.winfo_manager():
                 self.btn_rec_point.pack(side="left", padx=(0, 6), before=self.btn_rec_rope)
         else:
@@ -4550,6 +4588,7 @@ class App:
         self.btn_rec_top.pack(side="left", padx=(6, 0), after=self.btn_rec_rope)
         r2 = ttk.Frame(self.patrol_box)
         r2.pack(fill="x", pady=(4, 0))
+        ttk.Button(r2, text="＋ 下跳點", command=lambda: self.record_patrol("drop")).pack(side="left", padx=(0, 6))
         ttk.Button(r2, text="校準精準位置", command=self.calibrate_rope).pack(side="left", padx=(0, 6))
         ttk.Button(r2, text="繩子設定", command=self.edit_patrol_rope).pack(side="left", padx=(0, 6))
         ttk.Button(r2, text="刪除", command=self.del_patrol).pack(side="left", padx=(0, 6))
@@ -5699,6 +5738,10 @@ class App:
         if mode in ("random", "combat", "buff", "anchor"):
             for i, t in enumerate(self.cfg["patrol"]):
                 x, y = ox + t["x"] * scale, t["y"] * scale
+                if t["type"] == "drop":
+                    bottom = t.get("lands_y", t["y"] + 12) * scale
+                    self.canvas.create_line(x, y, x, bottom, fill="#e040fb", width=2, arrow="last", dash=(4, 2))
+                    continue
                 if t["type"] == "jump":
                     end = (t.get("macro") or {}).get("end")
                     if end:
@@ -6123,13 +6166,16 @@ class App:
                 info = ("◎精準 " if t.get("screen_anchor") else "△未校準 ") + info
                 if t.get("top"):
                     info = f"繩組｜繩上定點 ({t['top'][0]},{t['top'][1]})；" + info
+            elif t["type"] == "drop":
+                info = (f"下跳後落在 Y={t['lands_y']}" if t.get("lands_y") is not None
+                        else "尚未跳過（第一次需要往下時會在這裡跳，並記住落點）")
             elif t["type"] == "jump":
                 end = (t.get("macro") or {}).get("end") or ["?", "?"]
                 info = ("◎精準 " if t.get("screen_anchor") else "△未校準 ") + \
                     f"跳到 ({end[0]},{end[1]})；● 錄製動作（{macro_summary(t.get('macro'))}）"
             else:
                 info = "停留（BUFF 機有繩組時不使用）" if self.cfg.get("mode") == "buff" else "隨機攻擊、停留"
-            kind = {"rope": "繩組" if t.get("top") else "繩子", "jump": "跳台"}.get(t["type"], "巡邏點")
+            kind = {"rope": "繩組" if t.get("top") else "繩子", "jump": "跳台", "drop": "下跳點"}.get(t["type"], "巡邏點")
             self.tv_patrol.insert("", "end", iid=str(i), values=(i + 1, kind, t["x"], t["y"], info))
 
     def highlight_patrol(self, i):
@@ -6185,6 +6231,8 @@ class App:
         if typ == "rope":
             self.notify(f"已記錄繩子 #{len(self.cfg['patrol'])}（X={p[0]} Y={p[1]}）{extra}",
                         error="無法" in extra or "沒有" in extra)
+        elif typ == "drop":
+            self.notify(f"已記錄下跳點 #{len(self.cfg['patrol'])}（X={p[0]} Y={p[1]}）；第一次用到時會記住落在哪一層。")
 
     def record_rope_top(self):
         """記錄「繩上定點」，和選取的（或最後記錄的）繩子配成一組"""

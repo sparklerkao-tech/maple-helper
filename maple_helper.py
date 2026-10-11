@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.8"
+APP_VERSION = "v4.1.9"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -206,7 +206,7 @@ BUILTIN_MODEL = {
     "file": "monster_current_map_v2.pt",
     "version": "map_multiclass_v4",
     "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
-    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.8/monster_current_map_v2.pt",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.9/monster_current_map_v2.pt",
 }
 
 
@@ -1677,6 +1677,76 @@ class KeyRecorder(threading.Thread):
                    "ropes": infer_rope_segments(positions, events),
                    "start_img": self.start_img}
         self.app.ui(lambda: self.on_done(rec, self.cancelled))
+
+
+# TinyTask 的 .rec 是 Windows 錄製掛鉤（WH_JOURNALRECORD）的 EVENTMSG 陣列：
+#   UINT message, UINT paramL, UINT paramH, DWORD time(毫秒), HWND hwnd —— 32 位元版每筆 20 bytes（64 位元 24 bytes）
+_TT_KEY_DOWN = (0x100, 0x104)          # WM_KEYDOWN, WM_SYSKEYDOWN
+_TT_KEY_UP = (0x101, 0x105)            # WM_KEYUP, WM_SYSKEYUP
+_TT_MOUSE = {0x201: ("left", 1), 0x202: ("left", 0), 0x204: ("right", 1), 0x205: ("right", 0),
+             0x207: ("middle", 1), 0x208: ("middle", 0)}
+_TT_VK_EXTRA = {0x10: "shift", 0x11: "ctrl", 0x12: "alt"}
+
+
+def parse_tinytask(data, client_origin=None):
+    """把 TinyTask .rec 轉成本工具的錄製格式 {"events", "duration"}；回傳 (rec, 說明) 或 (None, 錯誤原因)。
+    client_origin＝(遊戲客戶區左上角螢幕座標)：滑鼠點擊換算成遊戲內座標；沒有就只匯入鍵盤。"""
+    import struct
+    best = None
+    for size in (20, 24):
+        if len(data) < size or len(data) % size:
+            continue
+        rows = []
+        for off in range(0, len(data), size):
+            msg, pl, ph, t = struct.unpack_from("<IIII", data, off)
+            rows.append((msg, pl, ph, t))
+        ok = sum(1 for r in rows if r[0] in _TT_KEY_DOWN + _TT_KEY_UP or 0x200 <= r[0] <= 0x20E)
+        if ok >= len(rows) * 0.9 and (best is None or ok > best[0]):
+            best = (ok, rows)
+    if best is None:
+        return None, "不是 TinyTask 的 .rec 檔（格式不符）"
+    rows = best[1]
+    vk2name = {v: k for k, v in VK_NAMES.items() if k in SCANCODES}
+    vk2name.update({vk: n for vk, n in _TT_VK_EXTRA.items() if n in SCANCODES})
+    t0 = rows[0][3]
+    events, held, skipped, clicks_dropped = [], set(), set(), 0
+    for msg, pl, ph, t in rows:
+        at = round(max(0, (t - t0) & 0xFFFFFFFF) / 1000.0, 4)
+        if msg in _TT_KEY_DOWN or msg in _TT_KEY_UP:
+            vk = pl & 0xFF
+            name = vk2name.get(vk)
+            if not name:
+                skipped.add(hex(vk))
+                continue
+            down = msg in _TT_KEY_DOWN
+            if down and name in held:
+                continue                      # 按住時的自動連發，不需要重複
+            if not down and name not in held:
+                continue                      # 錄製開始前就按著的鍵（例如 TinyTask 的熱鍵）
+            (held.add if down else held.discard)(name)
+            events.append([at, name, 1 if down else 0])
+        elif msg in _TT_MOUSE:
+            button, down = _TT_MOUSE[msg]
+            x, y = pl, ph
+            if client_origin is None:
+                clicks_dropped += 1
+                continue
+            events.append({"t": at, "kind": "mouse", "button": button, "down": down,
+                           "x": int(x - client_origin[0]), "y": int(y - client_origin[1])})
+    # 錄製結束時還按著的鍵（多半是 TinyTask 的停止熱鍵）不保留；播放結束本來就會放開全部按鍵
+    end_t = events[-1][0] if events and isinstance(events[-1], list) else (events[-1]["t"] if events else 0)
+    for name in list(held):
+        events = [e for e in events if not (isinstance(e, list) and e[1] == name and e[0] >= end_t - 1.0
+                                            and name in ("ctrl", "shift", "alt", "r", "p"))]
+    if not any(isinstance(e, list) for e in events):
+        return None, "裡面沒有可用的按鍵（可能只錄到滑鼠移動）"
+    duration = max(e[0] if isinstance(e, list) else e["t"] for e in events)
+    note = []
+    if skipped:
+        note.append(f"略過不支援的按鍵 {', '.join(sorted(skipped))}")
+    if clicks_dropped:
+        note.append(f"找不到遊戲視窗，略過 {clicks_dropped} 次滑鼠點擊")
+    return {"events": events, "duration": round(duration, 2), "source": "tinytask"}, "；".join(note)
 
 
 def macro_summary(rec):
@@ -3334,7 +3404,9 @@ class Bot(threading.Thread):
                         self.tick_skills()
                         if map_macro_index is not None:
                             self.status = f"隨機路線 {map_macro_index + 1}／{len(self.cfg.get('map_macros') or [map_macro])}：準備播放"
-                        self.play_macro(map_macro, align=False, suppress_loot=True, allow_buffs=True)
+                            log(f"播放路線 {map_macro_index + 1}" + (f"「{map_macro['name']}」" if map_macro.get("name") else ""))
+                        self.play_macro(map_macro, align=bool(map_macro.get("align_start") and map_macro.get("start")),
+                                        align_tol=self.cfg["goto_tolerance"], suppress_loot=True, allow_buffs=True)
                     elif self.loot_targets()[1]:
                         self.loot_items()
                     elif self.rope_pairs():
@@ -4564,7 +4636,8 @@ class App:
     def build_loot(self, host):
         f = ttk.Frame(host)
         macro = section(f, "整張地圖錄製", "錄下鍵盤、遊戲視窗內的滑鼠點擊，以及小地圖座標路徑。開始後會先放 Buff，再循環播放。")
-        button_row(macro, [("＋ 錄製隨機路線", self.record_map_macro), ("清除全部路線", self.clear_map_macro)])
+        button_row(macro, [("＋ 錄製隨機路線", self.record_map_macro), ("匯入 TinyTask…", self.import_tinytask),
+                           ("清除全部路線", self.clear_map_macro)])
         opts = self.cfg.get("map_macro_options", {})
         self.var_map_play_mode = tk.StringVar(value=opts.get("play_mode", "record"))
         play = ttk.Frame(macro)
@@ -7041,7 +7114,8 @@ class App:
         if routes:
             mode = routes[0].get("play_mode", self.cfg.get("map_macro_options", {}).get("play_mode", "record"))
             suffix = "座標監看已啟用，偏離會自動暫停。" if mode == "guarded" else "會照錄製操作循環播放。"
-            summaries = "；".join(f"#{i + 1} {macro_summary(rec)}" for i, rec in enumerate(routes))
+            summaries = "；".join(f"#{i + 1}{('「' + rec['name'] + '」') if rec.get('name') else ''} {macro_summary(rec)}"
+                                 for i, rec in enumerate(routes))
             self.lbl_map_macro.config(text=f"已錄製 {len(routes)} 條路線，BUFF 機每輪隨機選一條：{summaries}。{suffix}")
         else:
             self.lbl_map_macro.config(text="尚未錄製；BUFF 機仍可原地放 Buff／撿物。")
@@ -7079,6 +7153,49 @@ class App:
 
         # 全圖跑法通常較長，最多可錄十分鐘；按設定的「錄製結束」熱鍵可隨時完成。
         self.start_recording("整張地圖", saved, max_sec=600)
+
+    def import_tinytask(self):
+        """匯入一個或多個 TinyTask 錄製檔（.rec），每個檔案成為一條隨機路線"""
+        paths = filedialog.askopenfilenames(parent=self.root, title="選擇 TinyTask 錄製檔",
+                                            filetypes=[("TinyTask 錄製檔", "*.rec"), ("全部檔案", "*.*")])
+        if not paths:
+            return
+        rect = self.vision.rect
+        origin = (rect[0], rect[1]) if rect else None
+        p = self.vision.get_pos()
+        set_start = bool(p) and messagebox.askyesno(
+            "TinyTask 起點",
+            f"角色現在在小地圖 ({p[0]},{p[1]})。\n\n這些腳本都是從這個位置開始錄的嗎？\n"
+            "選「是」：每次播放前先走回這個位置再開始（腳本跑偏也能拉回來，比較穩）。\n"
+            "選「否」：直接從角色當下的位置開始播放。", parent=self.root) if p else False
+        routes = self.map_macro_routes()
+        added, errors = [], []
+        for path in paths:
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError as e:
+                errors.append(f"{os.path.basename(path)}：{e}")
+                continue
+            rec, note = parse_tinytask(data, origin)
+            if rec is None:
+                errors.append(f"{os.path.basename(path)}：{note}")
+                continue
+            rec["name"] = os.path.splitext(os.path.basename(path))[0]
+            rec["play_mode"] = "record"
+            if set_start:
+                rec["start"] = [p[0], p[1]]
+                rec["align_start"] = True
+            routes.append(rec)
+            added.append(f"{rec['name']}（{macro_summary(rec)}{'；' + note if note else ''}）")
+        if added:
+            self.cfg["map_macros"] = routes
+            self.cfg["map_macro"] = routes[0]
+            save_config(self.cfg)
+            self.update_map_macro_label()
+            self.notify(f"已匯入 {len(added)} 個 TinyTask 腳本：" + "、".join(added))
+        for e in errors:
+            self.notify(f"TinyTask 匯入失敗：{e}", error=True)
 
     def clear_map_macro(self):
         if not self.map_macro_routes():

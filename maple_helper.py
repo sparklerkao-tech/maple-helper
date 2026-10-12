@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.9"
+APP_VERSION = "v4.1.10"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -169,6 +169,7 @@ DEFAULT_CONFIG = {
         "tol_x": 4,             # 左右偏離幾 px 算離開定點
         "drift_sec": 0.6,       # 離開定點多久才回去（避免被擊退一下就移動）
         "release_for_buff": True,
+        "buff_release_wait": 0.6,   # 放開範圍技後等幾秒再按 Buff（等攻擊動作結束，按鍵才不會被吃掉）
         "turn_sec": 0,          # 每隔幾秒轉身一次；0 = 不轉
     },
     "red_dot": {
@@ -206,7 +207,7 @@ BUILTIN_MODEL = {
     "file": "monster_current_map_v2.pt",
     "version": "map_multiclass_v4",
     "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
-    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.9/monster_current_map_v2.pt",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.10/monster_current_map_v2.pt",
 }
 
 
@@ -1980,7 +1981,12 @@ class Bot(threading.Thread):
                 held = [k for k in (self.key("left"), self.key("right"), *extra) if k in self.kb.held]
                 for k in held:
                     self.kb.up(k)
-                self.kb.tap(s["key"])
+                if any(k in extra for k in held):
+                    # 剛放開按住的範圍技：角色還在攻擊動作中，馬上按 Buff 會被遊戲吃掉，先等攻擊動作結束
+                    self.status = f"放 Buff 前等攻擊動作結束：{s['name']}"
+                    time.sleep(max(0.0, float(self.cfg["anchor"].get("buff_release_wait", 0.6))))
+                self.kb.tap(s["key"], 0.1)
+                log(f"施放 Buff：{s['name']}")
                 self.skill_last[i] = time.time()
                 time.sleep(float(s.get("delay", 0.6)))
                 for k in held:
@@ -4572,6 +4578,10 @@ class App:
                         variable=self.var_anchor_rep, command=self.save_anchor).pack(anchor="w")
         ttk.Checkbutton(adv.body, text="放 Buff 時先放開，放完再按回去",
                         variable=self.var_anchor_buff, command=self.save_anchor).pack(anchor="w")
+        g3 = ttk.Frame(adv.body)
+        g3.pack(fill="x")
+        form_grid(g3, [("buff_release_wait", "放開後等多久再放 Buff(秒)")], a, self.anchor_vars, self.save_anchor, width=6,
+                  cols=1)
         self.update_anchor_label()
         return f
 

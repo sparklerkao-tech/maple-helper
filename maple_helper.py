@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.11"
+APP_VERSION = "v4.1.12"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -207,7 +207,7 @@ BUILTIN_MODEL = {
     "file": "monster_current_map_v2.pt",
     "version": "map_multiclass_v4",
     "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
-    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.11/monster_current_map_v2.pt",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.12/monster_current_map_v2.pt",
 }
 
 
@@ -922,39 +922,80 @@ def make_rope_anchor(img_bgr, tag_tpl):
     cx, ty, th, _ = c
     H, W = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    for half in (32, 48, 64):
+    # 只截頭頂正上方的「窄條」（主要是繩子本身）：遊戲背景有視差捲動，截太寬會把背景也當地標，
+    # 角色差 40 px 時背景只移動一部分，量出來的距離就不準（舊版 log 常見 +87、+212 這種錯誤）
+    for half in (20, 28, 40):
         x0, x1 = max(0, cx - half), min(W, cx + half)
         # 優先用頭頂上方（往上的繩子）；太靠近畫面上緣就改用腳下（往下的繩子）
-        top, bot = max(0, ty - 260), max(0, ty - 90)
+        top, bot = max(0, ty - 300), max(0, ty - 70)
         if bot - top < 60:
-            top, bot = min(H, ty + th + 10), min(H, ty + th + 150)
+            top, bot = min(H, ty + th + 10), min(H, ty + th + 170)
         if bot - top < 40 or x1 - x0 < 30:
             continue
         crop = gray[top:bot, x0:x1]
         if float(crop.std()) >= 10:      # 要有足夠的花紋才找得回來
-            return crop.copy(), {"dx": cx - x0, "dy": top - ty, "w": x1 - x0, "h": bot - top}
+            return crop.copy(), {"dx": cx - x0, "dy": top - ty, "w": x1 - x0, "h": bot - top, "v": 2}
     return None, "角色附近的畫面太單調，找不到可用的地標"
 
 
-def find_rope_anchor(img_bgr, tag_tpl, anchor_gray, meta, search=320, thr=0.55):
-    """在目前畫面找回地標。回傳 (角色應該在的 x, 角色目前 x, 相似度) 或 None"""
+ANCHOR_THR = 0.6       # 地標相似度門檻
+
+
+def match_rope_anchor(img_bgr, tag_tpl, anchor_gray, meta, search=None):
+    """在目前畫面找回地標。回傳 dict（want＝角色應該在的 x、cx＝角色目前 x、score、margin、各框位置），
+    找不到名牌回傳 None；找到名牌但地標不可靠時 want＝None，reason 說明原因"""
     c = locate_char(img_bgr, tag_tpl)
     if c is None or anchor_gray is None:
         return None
-    cx, ty, _, _ = c
+    cx, ty, th, tag_score = c
     H, W = img_bgr.shape[:2]
     h, w = anchor_gray.shape[:2]
+    tw = tag_tpl.shape[1]
+    out = {"cx": cx, "tag": (cx - tw // 2, ty, tw, th), "want": None, "score": 0.0, "margin": 0.0, "box": None}
+    if search is None:     # 只需要找「對得回來的範圍」：太遠的本來就不會採用，找越遠越容易對到別條繩子
+        search = ALIGN_MAX_PX + int(meta["dx"]) + 30
     y0 = max(0, ty + int(meta["dy"]) - 60)
     y1 = min(H, ty + int(meta["dy"]) + h + 60)
-    x0 = max(0, cx - search)
-    x1 = min(W, cx + search)
+    x0 = max(0, cx - int(meta["dx"]) - search)
+    x1 = min(W, cx - int(meta["dx"]) + w + search)
     if y1 - y0 < h or x1 - x0 < w:
-        return None
+        out["reason"] = "角色太靠近畫面邊緣"
+        return out
     gray = cv2.cvtColor(img_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
-    _, mx, _, loc = cv2.minMaxLoc(cv2.matchTemplate(gray, anchor_gray, cv2.TM_CCOEFF_NORMED))
-    if mx < thr:
+    res = cv2.matchTemplate(gray, anchor_gray, cv2.TM_CCOEFF_NORMED)
+    # 每一欄取最像的高度（同一條繩子上下段長得一樣），再找出所有「夠像」的位置（彼此至少隔 10 px）
+    col = res.max(axis=0)
+    rows = res.argmax(axis=0)
+    peaks = []
+    for x in np.argsort(-col):
+        if col[x] < ANCHOR_THR or len(peaks) >= 8:
+            break
+        if all(abs(int(x) - p) > 10 for p, _ in peaks):
+            peaks.append((int(x), float(col[x])))
+    if not peaks:
+        out.update(score=float(col.max()) if col.size else 0.0)
+        out["reason"] = f"地標相似度太低（{out['score']:.2f}）"
+        return out
+    # 每條繩子的圖都一樣，光看相似度分不出是哪一條；小地圖已經把角色帶到這條繩子附近，
+    # 所以取「離角色最近」的那一個，並確認對位範圍內沒有第二條繩子
+    cands = [(x0 + x + int(meta["dx"]) - cx, x, sc) for x, sc in peaks]
+    d, x, sc = min(cands, key=lambda c: abs(c[0]))
+    others = [c for c in cands if c[1] != x and abs(c[0]) <= ALIGN_MAX_PX]
+    out.update(score=sc, margin=sc - max((c[2] for c in others), default=0.0),
+               box=(x0 + x, y0 + int(rows[x]), w, h), peaks=[c[0] for c in cands])
+    if others:
+        out["reason"] = f"對位範圍內有兩個很像的位置（差 {d:+d} 和 {others[0][0]:+d} px），分不出是哪一條"
+    else:
+        out["want"] = cx + d
+    return out
+
+
+def find_rope_anchor(img_bgr, tag_tpl, anchor_gray, meta, search=None, thr=None):
+    """相容舊呼叫：回傳 (角色應該在的 x, 角色目前 x, 相似度) 或 None"""
+    m = match_rope_anchor(img_bgr, tag_tpl, anchor_gray, meta, search)
+    if m is None or m["want"] is None:
         return None
-    return x0 + loc[0] + int(meta["dx"]), cx, float(mx)
+    return m["want"], m["cx"], m["score"]
 
 
 def analyze_combat(img_bgr, cb, mon_tpls, tag_tpl, yolo=None):
@@ -2159,29 +2200,56 @@ class Bot(threading.Thread):
             cache[f] = None if img is None else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         return cache[f]
 
-    def screen_align(self, anchor, max_iter=12):
+    def measure_anchor(self, tag, tpl, anchor):
+        """量「還差幾 px」：連拍兩張，兩張都可靠且差不到 3 px 才採用（技能特效、怪物擋住時不亂動）。
+        回傳 (差距 or None, 原因)"""
+        got = []
+        for k in range(2):
+            if k:
+                time.sleep(0.06)
+            img = self.app.vision.grab_client()
+            m = match_rope_anchor(img, tag, tpl, anchor) if img is not None else None
+            if m is None:
+                return None, "畫面上找不到名牌"
+            if m["want"] is None:
+                return None, m.get("reason", "找不到繩子地標")
+            got.append(m["want"] - m["cx"])
+        if abs(got[0] - got[1]) > 3:
+            return None, f"兩張畫面量到的不一樣（{got[0]:+d}／{got[1]:+d} px）"
+        return int(round((got[0] + got[1]) / 2)), ""
+
+    def screen_align(self, anchor, max_iter=12, rope=None):
         """用遊戲畫面把角色對到記錄繩子時的精確位置（誤差 3 px 內）。回傳是否對準"""
         tag = self.app.scanner.tag_template
         tpl = self._anchor_gray(anchor) if anchor else None
         if tag is None or tpl is None:
             return False
+        fails = self.__dict__.setdefault("_anchor_fails", {})
+        key = anchor.get("file")
+
+        def failed(msg, warn=False):
+            self.status = f"精準對位：{msg}（改用小地圖位置）"
+            if warn:
+                log(self.status, "warn")
+            fails[key] = fails.get(key, 0) + 1
+            if fails[key] == 3:
+                where = f"繩子 X={rope.get('x')}" if rope else "這條繩子"
+                log(f"{where} 連續 3 次畫面對位失敗：建議站到抓得到繩子的位置，選取它按「校準精準位置」重新記錄；"
+                    "或按「測試精準對位」看看是哪裡對不到", "warn")
+            return False
+
         px_time = self.__dict__.get("_px_time", 0.008)    # 每走 1 px 要按多久（會自動修正）
         last = None
         for _ in range(max_iter):
             self.check()
-            img = self.app.vision.grab_client()
-            r = find_rope_anchor(img, tag, tpl, anchor)
-            if r is None:
-                self.status = "精準對位：畫面上找不到繩子地標（改用小地圖位置）"
-                return False
-            want, cx, score = r
-            d = want - cx
+            d, why = self.measure_anchor(tag, tpl, anchor)
+            if d is None:
+                return failed(why)
             if abs(d) > ALIGN_MAX_PX:
-                self.status = f"精準對位：差 {d:+d} px 太遠，可能對到旁邊的繩子，改用小地圖位置"
-                log(self.status, "warn")
-                return False
+                return failed(f"差 {d:+d} px 太遠，可能對到旁邊的繩子", warn=True)
             self.status = f"精準對位：差 {d:+d} px"
             if abs(d) <= 3:
+                fails[key] = 0
                 return True
             if last is not None:
                 moved = abs(last[0] - d)
@@ -2356,7 +2424,7 @@ class Bot(threading.Thread):
                     p0 = (rope_x, self._prehold_y0)
                 else:
                     self.quiet_wait(0.12)
-                    aligned = bool(anchor) and self.screen_align(anchor)
+                    aligned = bool(anchor) and self.screen_align(anchor, rope=rope)
                     if aligned:
                         # 精準地標對準＝角色站在記錄時抓得到繩子的位置：順便記下 YOLO 偏移，之後沒有地標時也對得準
                         if rope is not None and "yolo_dx" not in rope:
@@ -4730,6 +4798,7 @@ class App:
         r2.pack(fill="x", pady=(4, 0))
         ttk.Button(r2, text="＋ 下跳點", command=self.record_drop).pack(side="left", padx=(0, 6))
         ttk.Button(r2, text="校準精準位置", command=self.calibrate_rope).pack(side="left", padx=(0, 6))
+        ttk.Button(r2, text="測試精準對位", command=self.test_rope_anchor).pack(side="left", padx=(0, 6))
         ttk.Button(r2, text="繩子設定", command=self.edit_patrol_rope).pack(side="left", padx=(0, 6))
         ttk.Button(r2, text="刪除", command=self.del_patrol).pack(side="left", padx=(0, 6))
         ttk.Button(r2, text="清空", command=self.clear_patrol).pack(side="left")
@@ -6307,7 +6376,7 @@ class App:
                     ("先跳抓繩" if t.get("jump_to_grab") else "直接上爬")
                 info = (f"{climb}；落在 Y={t['lands_y']}" if t.get("lands_y") is not None
                         else f"{climb}；尚未爬過（第一次會自動記住）")
-                info = ("◎精準 " if t.get("screen_anchor") else "△未校準 ") + info
+                info = (("◎精準 " if t["screen_anchor"].get("v") == 2 else "○舊地標 ") if t.get("screen_anchor") else "△未校準 ") + info
                 if t.get("top"):
                     chain = t.get("chain") or []
                     drops = "".join(f" → 下跳 ({d['x']},{d['y']})" for d in chain)
@@ -6317,7 +6386,7 @@ class App:
                         else "尚未跳過（第一次需要往下時會在這裡跳，並記住落點）")
             elif t["type"] == "jump":
                 end = (t.get("macro") or {}).get("end") or ["?", "?"]
-                info = ("◎精準 " if t.get("screen_anchor") else "△未校準 ") + \
+                info = (("◎精準 " if t["screen_anchor"].get("v") == 2 else "○舊地標 ") if t.get("screen_anchor") else "△未校準 ") + \
                     f"跳到 ({end[0]},{end[1]})；● 錄製動作（{macro_summary(t.get('macro'))}）"
             else:
                 info = "停留（BUFF 機有繩組時不使用）" if self.cfg.get("mode") == "buff" else "隨機攻擊、停留"
@@ -6448,6 +6517,55 @@ class App:
         save_config(self.cfg)
         self.reload_patrol()
         self.notify(f"繩子 #{idx + 1}{msg}", error="無法" in msg or "沒有" in msg or "擷取" in msg)
+
+    def test_rope_anchor(self):
+        """角色站在選取的繩子附近時：量一次畫面對位，結果畫成圖片（diag 資料夾）方便確認"""
+        idx = self.sel_index(self.tv_patrol)
+        if idx is None or self.cfg["patrol"][idx].get("type") not in ("rope", "jump"):
+            self.notify("請先選取一條繩子，並讓角色走到那條繩子附近。", error=True)
+            return
+        r = self.cfg["patrol"][idx]
+        anchor = r.get("screen_anchor")
+        tag = self.scanner.tag_template
+        if tag is None:
+            self.notify("還沒有框選角色名牌（「撿物」或「自動戰鬥」頁的「框選角色名牌」）。", error=True)
+            return
+        if not anchor:
+            self.notify("這條繩子還沒有精準位置：站到按↑就抓得到的位置，按「校準精準位置」。", error=True)
+            return
+        tpl = self.bot._anchor_gray(anchor)
+        img = self.vision.grab_client()
+        if img is None or tpl is None:
+            self.notify("擷取不到遊戲畫面或地標圖檔。", error=True)
+            return
+        m = match_rope_anchor(img, tag, tpl, anchor)
+        if m is None:
+            self.notify("畫面上找不到你的名牌：名牌被擋住，或需要重新框選名牌。", error=True)
+            return
+        vis = img.copy()
+        x, y, w, h = m["tag"]
+        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        if m["box"]:
+            bx, by, bw, bh = m["box"]
+            color = (0, 200, 255) if m["want"] is not None else (0, 0, 255)
+            cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), color, 2)
+        if m["want"] is not None:
+            cv2.line(vis, (m["want"], y - 40), (m["want"], y + h), (0, 200, 255), 2)
+        os.makedirs(DIAG_DIR, exist_ok=True)
+        path = os.path.join(DIAG_DIR, "精準對位測試.png")
+        imwrite_unicode(path, vis)
+        if m["want"] is None:
+            msg = f"繩子 #{idx + 1}：{m.get('reason')}。"
+            ok = False
+        else:
+            d = m["want"] - m["cx"]
+            ok = abs(d) <= ALIGN_MAX_PX
+            msg = (f"繩子 #{idx + 1}：角色還差 {d:+d} px（相似度 {m['score']:.2f}）。"
+                   + ("" if anchor.get("v") == 2 else "這是舊版地標（會被背景視差影響），建議按「校準精準位置」重新記錄。")
+                   + ("" if ok else "差太遠，對位時不會採用。"))
+        log(msg)
+        self.notify(msg + f" 圖片：diag\\精準對位測試.png（綠框＝名牌，橘框＝找到的地標，紅框＝不可靠）",
+                    error=not ok)
 
     def edit_patrol_rope(self):
         idx = self.sel_index(self.tv_patrol)

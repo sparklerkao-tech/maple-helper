@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.10"
+APP_VERSION = "v4.1.11"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -207,7 +207,7 @@ BUILTIN_MODEL = {
     "file": "monster_current_map_v2.pt",
     "version": "map_multiclass_v4",
     "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
-    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.10/monster_current_map_v2.pt",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.11/monster_current_map_v2.pt",
 }
 
 
@@ -1975,15 +1975,19 @@ class Bot(threading.Thread):
                 continue
             if now - self.skill_last.get(i, 0) >= float(s["interval"]):
                 self.status = f"施放：{s['name']}"
-                extra = []
-                if self.cfg.get("mode") == "anchor" and self.cfg["anchor"].get("release_for_buff", True):
-                    extra = [self.cfg["anchor"]["hold_key"]]
-                held = [k for k in (self.key("left"), self.key("right"), *extra) if k in self.kb.held]
+                # 放開「所有」按著的鍵：定點的範圍技、菁英模式按住的主攻擊鍵（例如 Ctrl）、方向鍵。
+                # 只要還有攻擊鍵按著，Buff 鍵就會被吃掉（按著 Ctrl 再按 C 也會變成組合鍵）。
+                keep = set()
+                if self.cfg.get("mode") == "anchor" and not self.cfg["anchor"].get("release_for_buff", True):
+                    keep.add(self.cfg["anchor"].get("hold_key"))
+                dirs = {self.key("left"), self.key("right"), self.key("up"), self.key("down")}
+                held = [k for k in list(self.kb.held) if k not in keep and k != s["key"]]
                 for k in held:
                     self.kb.up(k)
-                if any(k in extra for k in held):
-                    # 剛放開按住的範圍技：角色還在攻擊動作中，馬上按 Buff 會被遊戲吃掉，先等攻擊動作結束
-                    self.status = f"放 Buff 前等攻擊動作結束：{s['name']}"
+                attacking = [k for k in held if k not in dirs]
+                if attacking:
+                    # 剛放開攻擊鍵：角色還在攻擊動作中，馬上按 Buff 會被遊戲吃掉，先等攻擊動作結束
+                    self.status = f"放 Buff 前等攻擊動作結束：{s['name']}（放開 {', '.join(attacking)}）"
                     time.sleep(max(0.0, float(self.cfg["anchor"].get("buff_release_wait", 0.6))))
                 self.kb.tap(s["key"], 0.1)
                 log(f"施放 Buff：{s['name']}")

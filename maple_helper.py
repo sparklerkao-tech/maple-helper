@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.12"
+APP_VERSION = "v4.1.13"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -191,6 +191,7 @@ TAG_DIR = os.path.join(TEMPLATE_DIR, "char")
 TAG_PATH = os.path.join(TAG_DIR, "nametag.png")
 ITEM_DIR = os.path.join(TEMPLATE_DIR, "items")
 ROPE_DIR = os.path.join(TEMPLATE_DIR, "ropes")
+BUFF_ICON_DIR = os.path.join(TEMPLATE_DIR, "buffs")
 YOLO_DATA_DIR = os.path.join(APP_DIR, "yolo_data")
 YOLO_IMAGES_DIR = os.path.join(YOLO_DATA_DIR, "images")
 YOLO_LABELS_DIR = os.path.join(YOLO_DATA_DIR, "labels")
@@ -207,7 +208,7 @@ BUILTIN_MODEL = {
     "file": "monster_current_map_v2.pt",
     "version": "map_multiclass_v4",
     "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
-    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.12/monster_current_map_v2.pt",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.13/monster_current_map_v2.pt",
 }
 
 
@@ -996,6 +997,24 @@ def find_rope_anchor(img_bgr, tag_tpl, anchor_gray, meta, search=None, thr=None)
     if m is None or m["want"] is None:
         return None
     return m["want"], m["cx"], m["score"]
+
+
+def buff_bar(img_bgr):
+    """遊戲畫面上方的 Buff 圖示列（右上角）：回傳灰階裁切"""
+    H, W = img_bgr.shape[:2]
+    return cv2.cvtColor(img_bgr[0:min(H, 140), W // 3:W], cv2.COLOR_BGR2GRAY)
+
+
+def buff_icon_present(img_bgr, icon_gray, thr=0.8):
+    """Buff 圖示是否在畫面上方的 Buff 列裡。回傳 (有沒有, 相似度)；畫面或圖示有問題回傳 (None, 0)"""
+    if img_bgr is None or icon_gray is None:
+        return None, 0.0
+    bar = buff_bar(img_bgr)
+    h, w = icon_gray.shape[:2]
+    if h > bar.shape[0] or w > bar.shape[1]:
+        return None, 0.0
+    _, mx, _, _ = cv2.minMaxLoc(cv2.matchTemplate(bar, icon_gray, cv2.TM_CCOEFF_NORMED))
+    return mx >= thr, float(mx)
 
 
 def analyze_combat(img_bgr, cb, mon_tpls, tag_tpl, yolo=None):
@@ -2007,35 +2026,135 @@ class Bot(threading.Thread):
     def pos(self):
         return self.app.vision.get_pos()
 
-    def tick_skills(self, allow_attack=False):
-        if self.climbing:
-            return
-        now = time.time()
+    def buff_icon(self, s):
+        """技能框選的 Buff 圖示（灰階），沒有設定回傳 None"""
+        f = s.get("icon")
+        if not f:
+            return None
+        cache = self.__dict__.setdefault("_icon_cache", {})
+        if f not in cache:
+            img = imread_unicode(os.path.join(BUFF_ICON_DIR, f))
+            cache[f] = None if img is None else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return cache[f]
+
+    def icon_state(self, s, img=None):
+        """這個 Buff 的圖示現在在不在畫面上：True／False；沒設圖示或擷取不到畫面回傳 None"""
+        icon = self.buff_icon(s)
+        if icon is None:
+            return None
+        try:
+            img = img if img is not None else self.app.vision.grab_client()
+        except Exception:
+            img = None
+        return buff_icon_present(img, icon)[0]
+
+    def wait_still(self, stable=0.3, timeout=2.0):
+        """等角色站穩（小地圖座標連續 stable 秒不變）。被怪撞飛、跳在空中、還在滑行時放 Buff 會被遊戲吃掉"""
+        start = time.time()
+        last, since = self.pos(), time.time()
+        while time.time() - start < timeout:
+            time.sleep(0.03)
+            p = self.pos()
+            if p is None:
+                continue
+            if p != last:
+                last, since = p, time.time()
+            elif time.time() - since >= stable:
+                return True
+        return False
+
+    def due_skills(self, now):
+        """該放的 Buff：時間到了，或有設圖示且圖示已經消失一段時間（Buff 提早沒了、上次沒放出來）"""
+        due = []
+        check_icons = now - self.__dict__.get("_icon_check_at", 0) >= 2.0
+        if check_icons:
+            self._icon_check_at = now
+            img = None
+        miss = self.__dict__.setdefault("_icon_miss", {})
         for i, s in enumerate(self.cfg["skills"]):
             if not s.get("enabled"):
                 continue
             if now - self.skill_last.get(i, 0) >= float(s["interval"]):
-                self.status = f"施放：{s['name']}"
-                # 放開「所有」按著的鍵：定點的範圍技、菁英模式按住的主攻擊鍵（例如 Ctrl）、方向鍵。
-                # 只要還有攻擊鍵按著，Buff 鍵就會被吃掉（按著 Ctrl 再按 C 也會變成組合鍵）。
-                keep = set()
-                if self.cfg.get("mode") == "anchor" and not self.cfg["anchor"].get("release_for_buff", True):
-                    keep.add(self.cfg["anchor"].get("hold_key"))
-                dirs = {self.key("left"), self.key("right"), self.key("up"), self.key("down")}
-                held = [k for k in list(self.kb.held) if k not in keep and k != s["key"]]
-                for k in held:
-                    self.kb.up(k)
-                attacking = [k for k in held if k not in dirs]
-                if attacking:
-                    # 剛放開攻擊鍵：角色還在攻擊動作中，馬上按 Buff 會被遊戲吃掉，先等攻擊動作結束
-                    self.status = f"放 Buff 前等攻擊動作結束：{s['name']}（放開 {', '.join(attacking)}）"
-                    time.sleep(max(0.0, float(self.cfg["anchor"].get("buff_release_wait", 0.6))))
+                due.append((i, s, "時間到"))
+                continue
+            if check_icons and s.get("icon") and now - self.skill_last.get(i, 0) >= 8:
+                if img is None:
+                    try:
+                        img = self.app.vision.grab_client()
+                    except Exception:
+                        img = None
+                st = self.icon_state(s, img)
+                miss[i] = miss.get(i, 0) + 1 if st is False else 0
+                if miss[i] >= 3:           # 連續 3 次（約 6 秒）都看不到圖示：補放
+                    miss[i] = 0
+                    due.append((i, s, "畫面上看不到 Buff 圖示"))
+        return due
+
+    def cast_buff(self, i, s, why="時間到"):
+        """放一個 Buff：放開按著的鍵 → 等攻擊動作結束 → 等角色站穩 → 按 Buff → （有圖示）確認有放出來，沒有就重放"""
+        self.status = f"施放：{s['name']}"
+        # 放開「所有」按著的鍵：定點的範圍技、菁英模式按住的主攻擊鍵（例如 Ctrl）、方向鍵。
+        # 只要還有攻擊鍵按著，Buff 鍵就會被吃掉（按著 Ctrl 再按 C 也會變成組合鍵）。
+        keep = set()
+        if self.cfg.get("mode") == "anchor" and not self.cfg["anchor"].get("release_for_buff", True):
+            keep.add(self.cfg["anchor"].get("hold_key"))
+        dirs = {self.key("left"), self.key("right"), self.key("up"), self.key("down")}
+        held = [k for k in list(self.kb.held) if k not in keep and k != s["key"]]
+        for k in held:
+            self.kb.up(k)
+        self.__dict__.setdefault("_icon_miss", {})[i] = 0
+        done = False
+        try:
+            attacking = [k for k in held if k not in dirs]
+            if attacking:
+                # 剛放開攻擊鍵：角色還在攻擊動作中，馬上按 Buff 會被遊戲吃掉，先等攻擊動作結束
+                self.status = f"放 Buff 前等攻擊動作結束：{s['name']}（放開 {', '.join(attacking)}）"
+                time.sleep(max(0.0, float(self.cfg["anchor"].get("buff_release_wait", 0.6))))
+            has_icon = self.buff_icon(s) is not None
+            tries = 3 if has_icon else 1
+            for t in range(tries):
+                self.check(allow_elite=False)
+                if not self.wait_still():
+                    log(f"施放 Buff：{s['name']}：角色一直在動（被怪撞？），還是先按", "warn")
                 self.kb.tap(s["key"], 0.1)
-                log(f"施放 Buff：{s['name']}")
                 self.skill_last[i] = time.time()
                 time.sleep(float(s.get("delay", 0.6)))
+                if not has_icon:
+                    log(f"施放 Buff：{s['name']}" + ("" if why == "時間到" else f"（{why}）"))
+                    done = True
+                    return True
+                ok = None
+                for _ in range(4):                 # 圖示出現可能慢一點，最多再看 0.8 秒
+                    ok = self.icon_state(s)
+                    if ok is not False:
+                        break
+                    time.sleep(0.2)
+                if ok is not False:
+                    log(f"施放 Buff：{s['name']}" + ("" if why == "時間到" else f"（{why}）")
+                        + ("，已確認圖示出現" if ok else "") + (f"（第 {t + 1} 次才成功）" if t else ""))
+                    done = True
+                    return True
+                log(f"施放 Buff：{s['name']}：畫面上沒看到圖示，重放（{t + 1}/{tries}）", "warn")
+            # 重放幾次都沒成功：20 秒後再試，不用等完整的間隔
+            self.skill_last[i] = time.time() - float(s["interval"]) + 20
+            log(f"施放 Buff：{s['name']} 連續 {tries} 次都沒看到圖示（MP 不夠？按鍵設錯？圖示要重框？），20 秒後再試", "warn")
+            done = True
+            return False
+        finally:
+            if done:      # 被暫停／停止中斷時不要把鍵按回去
                 for k in held:
-                    self.kb.down(k)
+                    if k not in self.kb.held:
+                        self.kb.down(k)
+
+    def tick_skills(self, allow_attack=False):
+        if self.climbing:
+            return
+        # 定點掛機走回定點的路上先不放：邊走邊放容易在滑行中被吃掉，到定點站穩再放
+        if self.__dict__.get("_in_goto") and self.cfg.get("mode") == "anchor":
+            return
+        now = time.time()
+        for i, s, why in self.due_skills(now):
+            self.cast_buff(i, s, why)
         if allow_attack:
             a = self.cfg["attack"]
             if a.get("enabled") and now - self.attack_last >= float(a["interval"]):
@@ -2071,7 +2190,8 @@ class Bot(threading.Thread):
         for i, s in enabled:
             self.check(allow_elite=False)
             self.status = f"啟動 Buff：{s['name']}"
-            self.kb.tap(s["key"])
+            self.wait_still(timeout=1.0)
+            self.kb.tap(s["key"], 0.1)
             self.skill_last[i] = time.time()
             self.quiet_wait(max(0.0, float(s.get("delay", 0.6))))
         wait = max(0.0, float(self.cfg.get("buff_start_wait", 1.0)))
@@ -2092,6 +2212,7 @@ class Bot(threading.Thread):
         self.early_grab = False
         self._prehold_y0 = None
         self.status = f"移動到 X={tx}"
+        self._in_goto = True
         start = time.time()
         last_x, last_move = None, time.time()
         cur_dir = None
@@ -2171,6 +2292,7 @@ class Bot(threading.Thread):
                 time.sleep(0.02)
             return False
         finally:
+            self._in_goto = False
             if cur_dir:
                 self.kb.up(cur_dir)
 
@@ -5438,7 +5560,7 @@ class App:
         tk.Label(win, image=win._image).pack()
 
     def build_skill(self, f):
-        box = section(f, "Buff／定時技能", "勾選即啟用；每隔設定秒數自動施放，按開始時會先各放一次。直接修改，自動儲存。")
+        box = section(f, "Buff／定時技能", "勾選即啟用；每隔設定秒數自動施放，按開始時會先各放一次。直接修改，自動儲存。「框圖示」：框選畫面右上角這個 Buff 的小圖示，放完會確認有沒有放出來（沒有就重放），圖示提早消失也會補放。")
         self.skill_grid = ttk.Frame(box)
         self.skill_grid.pack(fill="x")
         button_row(box, [("＋ 新增技能", self.add_skill)])
@@ -6056,7 +6178,7 @@ class App:
         g = self.skill_grid
         for w in g.winfo_children():
             w.destroy()
-        for c, t in enumerate(("啟用", "名稱", "按鍵", "每隔(秒)", "施放後等待", "")):
+        for c, t in enumerate(("啟用", "名稱", "按鍵", "每隔(秒)", "施放後等待", "圖示", "")):
             ttk.Label(g, text=t, style="Hint.TLabel").grid(row=0, column=c, sticky="w", padx=2)
         g.columnconfigure(1, weight=1)
         self.skill_rows = []
@@ -6082,10 +6204,12 @@ class App:
             for e in entries:
                 e.bind("<FocusOut>", lambda _e, sv=save: sv())
                 e.bind("<Return>", lambda _e, sv=save: sv())
-            ttk.Button(g, text="✕", width=3, command=lambda i=i: self.del_skill(i)).grid(row=r, column=5, padx=(2, 0))
+            ttk.Button(g, text="✓圖示" if sk.get("icon") else "框圖示", width=6,
+                       command=lambda i=i: self.set_buff_icon(i)).grid(row=r, column=5, padx=2)
+            ttk.Button(g, text="✕", width=3, command=lambda i=i: self.del_skill(i)).grid(row=r, column=6, padx=(2, 0))
             self.skill_rows.append((on, name, key, itv, dly))
         if not self.cfg["skills"]:
-            ttk.Label(g, text="尚未新增技能", style="Hint.TLabel").grid(row=1, column=0, columnspan=6, sticky="w")
+            ttk.Label(g, text="尚未新增技能", style="Hint.TLabel").grid(row=1, column=0, columnspan=7, sticky="w")
 
     def save_buff_wait(self):
         try:
@@ -6130,9 +6254,62 @@ class App:
         self.reload_skills()
         self.notify(f"已新增技能{n}：請選擇按鍵並設定秒數。")
 
+    def set_buff_icon(self, i):
+        """框選這個 Buff 在畫面右上角的圖示：之後放完會確認圖示有出現（沒有就重放），圖示消失也會提早補放"""
+        if not 0 <= i < len(self.cfg["skills"]):
+            return
+        sk = self.cfg["skills"][i]
+        if sk.get("icon"):
+            ans = messagebox.askyesnocancel(
+                "Buff 圖示", f"「{sk.get('name')}」已經有圖示。\n\n是：重新框選\n否：清除圖示（不再確認有沒有放出來）",
+                parent=self.root)
+            if ans is None:
+                return
+            if ans is False:
+                self._remove_icon_file(sk.pop("icon", None))
+                save_config(self.cfg)
+                self.reload_skills()
+                self.notify(f"已清除「{sk.get('name')}」的 Buff 圖示")
+                return
+        img = self.vision.grab_client() if IS_WIN else None
+        if img is None:
+            self.notify("找不到遊戲視窗。", error=True)
+            return
+
+        def done(rect):
+            x, y, w, h = rect
+            if w < 8 or h < 8:
+                self.notify("框太小了，請框住整個 Buff 圖示。", error=True)
+                return
+            path = new_template_path(BUFF_ICON_DIR, "buff")
+            imwrite_unicode(path, img[y:y + h, x:x + w])
+            old = sk.get("icon")
+            sk["icon"] = os.path.basename(path)
+            self._remove_icon_file(old)
+            self.bot.__dict__.pop("_icon_cache", None)
+            save_config(self.cfg)
+            self.reload_skills()
+            found, score = buff_icon_present(img, self.bot.buff_icon(sk))
+            if found:
+                self.notify(f"「{sk.get('name')}」的 Buff 圖示已設定：放完會確認有沒有放出來，圖示消失也會提早補放。")
+            else:
+                self.notify(f"「{sk.get('name')}」的圖示已存，但它不在畫面上方的 Buff 列（相似度 {score:.2f}）；"
+                            "請框右上角 Buff 列裡的小圖示，不是技能欄的圖示。", error=True)
+
+        RectSelector(self.root, img, done,
+                     title=f"先放「{sk.get('name')}」，再框選畫面右上角 Buff 列裡它的小圖示（只框一個圖示），按 Enter 確認")
+
+    def _remove_icon_file(self, f):
+        if f:
+            try:
+                os.remove(os.path.join(BUFF_ICON_DIR, f))
+            except OSError:
+                pass
+
     def del_skill(self, i):
         if 0 <= i < len(self.cfg["skills"]):
             name = self.cfg["skills"][i].get("name", "")
+            self._remove_icon_file(self.cfg["skills"][i].get("icon"))
             del self.cfg["skills"][i]
             self.bot.skill_last = {}
             save_config(self.cfg)

@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.13"
+APP_VERSION = "v4.1.14"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -208,7 +208,7 @@ BUILTIN_MODEL = {
     "file": "monster_current_map_v2.pt",
     "version": "map_multiclass_v4",
     "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
-    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.13/monster_current_map_v2.pt",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.14/monster_current_map_v2.pt",
 }
 
 
@@ -1790,17 +1790,20 @@ def parse_tinytask(data, client_origin=None):
             button, down = _TT_MOUSE[msg]
             x, y = pl, ph
             if client_origin is None:
-                clicks_dropped += 1
+                clicks_dropped += 1 if down else 0
                 continue
+            # sx/sy＝錄製時的螢幕座標（保留下來，之後要重新換算時用）；x/y＝遊戲客戶區座標
             events.append({"t": at, "kind": "mouse", "button": button, "down": down,
-                           "x": int(x - client_origin[0]), "y": int(y - client_origin[1])})
+                           "x": int(x - client_origin[0]), "y": int(y - client_origin[1]), "sx": int(x), "sy": int(y)})
     # 錄製結束時還按著的鍵（多半是 TinyTask 的停止熱鍵）不保留；播放結束本來就會放開全部按鍵
     end_t = events[-1][0] if events and isinstance(events[-1], list) else (events[-1]["t"] if events else 0)
     for name in list(held):
         events = [e for e in events if not (isinstance(e, list) and e[1] == name and e[0] >= end_t - 1.0
                                             and name in ("ctrl", "shift", "alt", "r", "p"))]
-    if not any(isinstance(e, list) for e in events):
-        return None, "裡面沒有可用的按鍵（可能只錄到滑鼠移動）"
+    if not events:
+        if clicks_dropped:
+            return None, f"只有滑鼠點擊（{clicks_dropped} 次），但找不到遊戲視窗，無法換算點擊位置；請先開遊戲再匯入"
+        return None, "裡面沒有可用的按鍵或滑鼠點擊（可能只錄到滑鼠移動）"
     duration = max(e[0] if isinstance(e, list) else e["t"] for e in events)
     note = []
     if skipped:
@@ -1815,7 +1818,8 @@ def macro_summary(rec):
         return "（無）"
     keys = sum(1 for e in rec["events"] if isinstance(e, (list, tuple)) and len(e) >= 3 and e[2])
     clicks = sum(1 for e in rec["events"] if isinstance(e, dict) and e.get("kind") == "mouse" and e.get("down"))
-    detail = f"{keys} 個按鍵" + (f"、{clicks} 次點擊" if clicks else "")
+    detail = "、".join(x for x in ((f"{keys} 個按鍵" if keys or not clicks else ""),
+                                   (f"{clicks} 次點擊" if clicks else "")) if x)
     points = len(rec.get("path") or [])
     if points:
         detail += f"、{points} 個座標"
@@ -2110,41 +2114,47 @@ class Bot(threading.Thread):
                 # 剛放開攻擊鍵：角色還在攻擊動作中，馬上按 Buff 會被遊戲吃掉，先等攻擊動作結束
                 self.status = f"放 Buff 前等攻擊動作結束：{s['name']}（放開 {', '.join(attacking)}）"
                 time.sleep(max(0.0, float(self.cfg["anchor"].get("buff_release_wait", 0.6))))
-            has_icon = self.buff_icon(s) is not None
-            tries = 3 if has_icon else 1
-            for t in range(tries):
-                self.check(allow_elite=False)
-                if not self.wait_still():
-                    log(f"施放 Buff：{s['name']}：角色一直在動（被怪撞？），還是先按", "warn")
-                self.kb.tap(s["key"], 0.1)
-                self.skill_last[i] = time.time()
-                time.sleep(float(s.get("delay", 0.6)))
-                if not has_icon:
-                    log(f"施放 Buff：{s['name']}" + ("" if why == "時間到" else f"（{why}）"))
-                    done = True
-                    return True
-                ok = None
-                for _ in range(4):                 # 圖示出現可能慢一點，最多再看 0.8 秒
-                    ok = self.icon_state(s)
-                    if ok is not False:
-                        break
-                    time.sleep(0.2)
-                if ok is not False:
-                    log(f"施放 Buff：{s['name']}" + ("" if why == "時間到" else f"（{why}）")
-                        + ("，已確認圖示出現" if ok else "") + (f"（第 {t + 1} 次才成功）" if t else ""))
-                    done = True
-                    return True
-                log(f"施放 Buff：{s['name']}：畫面上沒看到圖示，重放（{t + 1}/{tries}）", "warn")
-            # 重放幾次都沒成功：20 秒後再試，不用等完整的間隔
-            self.skill_last[i] = time.time() - float(s["interval"]) + 20
-            log(f"施放 Buff：{s['name']} 連續 {tries} 次都沒看到圖示（MP 不夠？按鍵設錯？圖示要重框？），20 秒後再試", "warn")
+            ok = self.tap_buff_confirm(i, s, "施放 Buff", why, time.sleep)
             done = True
-            return False
+            return ok
         finally:
             if done:      # 被暫停／停止中斷時不要把鍵按回去
                 for k in held:
                     if k not in self.kb.held:
                         self.kb.down(k)
+
+    def tap_buff_confirm(self, i, s, label, why="時間到", wait=None):
+        """按 Buff 鍵；有框圖示就確認圖示出現，沒有就重放（最多 3 次）。
+        wait＝等待用的函式（定時用 time.sleep；開始時用 quiet_wait，不被菁英中斷）。回傳是否確定放出來"""
+        wait = wait or time.sleep
+        has_icon = self.buff_icon(s) is not None
+        tries = 3 if has_icon else 1
+        tail = "" if why == "時間到" else f"（{why}）"
+        for t in range(tries):
+            self.check(allow_elite=False)
+            if not self.wait_still():
+                log(f"{label}：{s['name']}：角色一直在動（被怪撞？），還是先按", "warn")
+            self.kb.tap(s["key"], 0.1)
+            self.skill_last[i] = time.time()
+            wait(max(0.0, float(s.get("delay", 0.6))))
+            if not has_icon:
+                log(f"{label}：{s['name']}{tail}")
+                return True
+            ok = None
+            for _ in range(4):                 # 圖示出現可能慢一點，最多再看 0.8 秒
+                ok = self.icon_state(s)
+                if ok is not False:
+                    break
+                wait(0.2)
+            if ok is not False:
+                log(f"{label}：{s['name']}{tail}" + ("，已確認圖示出現" if ok else "")
+                    + (f"（第 {t + 1} 次才成功）" if t else ""))
+                return True
+            log(f"{label}：{s['name']}：畫面上沒看到圖示，重放（{t + 1}/{tries}）", "warn")
+        # 重放幾次都沒成功：20 秒後再試，不用等完整的間隔
+        self.skill_last[i] = time.time() - float(s["interval"]) + 20
+        log(f"{label}：{s['name']} 連續 {tries} 次都沒看到圖示（MP 不夠？按鍵設錯？圖示要重框？），20 秒後再試", "warn")
+        return False
 
     def tick_skills(self, allow_attack=False):
         if self.climbing:
@@ -2187,13 +2197,14 @@ class Bot(threading.Thread):
                 time.sleep(0.05)
         self.check(allow_elite=False)             # 「只在前景送鍵」開啟時，會等到遊戲在前景
         self.quiet_wait(0.25)          # 切到遊戲後給一點時間，按鍵才不會被吃掉
+        failed = []
         for i, s in enabled:
             self.check(allow_elite=False)
             self.status = f"啟動 Buff：{s['name']}"
-            self.wait_still(timeout=1.0)
-            self.kb.tap(s["key"], 0.1)
-            self.skill_last[i] = time.time()
-            self.quiet_wait(max(0.0, float(s.get("delay", 0.6))))
+            if not self.tap_buff_confirm(i, s, "啟動 Buff", "時間到", self.quiet_wait):
+                failed.append(s["name"])
+        if failed:
+            log(f"開始時沒確認到的 Buff：{'、'.join(failed)}（掛機中會每 20 秒再試）", "warn")
         wait = max(0.0, float(self.cfg.get("buff_start_wait", 1.0)))
         if wait:
             self.status = f"Buff 放完，{wait:g} 秒後開始"
@@ -2357,7 +2368,7 @@ class Bot(threading.Thread):
             if fails[key] == 3:
                 where = f"繩子 X={rope.get('x')}" if rope else "這條繩子"
                 log(f"{where} 連續 3 次畫面對位失敗：建議站到抓得到繩子的位置，選取它按「校準精準位置」重新記錄；"
-                    "或按「測試精準對位」看看是哪裡對不到", "warn")
+                    "或按「測試對位」看看是哪裡對不到", "warn")
             return False
 
         px_time = self.__dict__.get("_px_time", 0.008)    # 每走 1 px 要按多久（會自動修正）
@@ -4920,7 +4931,7 @@ class App:
         r2.pack(fill="x", pady=(4, 0))
         ttk.Button(r2, text="＋ 下跳點", command=self.record_drop).pack(side="left", padx=(0, 6))
         ttk.Button(r2, text="校準精準位置", command=self.calibrate_rope).pack(side="left", padx=(0, 6))
-        ttk.Button(r2, text="測試精準對位", command=self.test_rope_anchor).pack(side="left", padx=(0, 6))
+        ttk.Button(r2, text="測試對位", command=self.test_rope_anchor).pack(side="left", padx=(0, 6))
         ttk.Button(r2, text="繩子設定", command=self.edit_patrol_rope).pack(side="left", padx=(0, 6))
         ttk.Button(r2, text="刪除", command=self.del_patrol).pack(side="left", padx=(0, 6))
         ttk.Button(r2, text="清空", command=self.clear_patrol).pack(side="left")
@@ -5105,14 +5116,20 @@ class App:
         self.update_yolo_model_label()
         return True
 
-    def offer_model_update(self, reason):
-        """詢問是否更新成內建模型（每次開啟只問一次）"""
+    def offer_model_update(self, reason, remember_no=False):
+        """詢問是否更新成內建模型（每次開啟只問一次）。remember_no：選「否」就記住，這一版內建模型不再問"""
         if getattr(self, "_model_offer_done", False) or not self.alive_ui:
             return
         self._model_offer_done = True
         if messagebox.askyesno("更新 YOLO 模型", f"{reason}\n\n要下載內建的四類模型（怪物／道具／繩子／人物）嗎？\n"
-                               "原本的模型會備份成 .bak 檔。", parent=self.root):
+                               "原本的模型會備份成 .bak 檔。"
+                               + ("\n\n選「否」：這一版內建模型不再詢問（之後可在「AI 辨識」頁按「更新內建模型」）。"
+                                  if remember_no else ""), parent=self.root):
             self.update_builtin_model()
+        elif remember_no:
+            self.cfg.setdefault("yolo", {})["model_declined"] = BUILTIN_MODEL["sha256"]
+            save_config(self.cfg)
+            log(f"不更新內建 YOLO 模型（{BUILTIN_MODEL['version']}），這一版不再詢問")
 
     def update_builtin_model(self):
         """下載內建模型、比對 SHA-256，舊模型備份後換上；在背景執行"""
@@ -5160,9 +5177,26 @@ class App:
         """開啟時：YOLO 已啟用但模型檔不在（例如新電腦），詢問是否下載內建模型"""
         yc = self.cfg.get("yolo", {})
         path = self.scanner.yolo.model_path()
-        if yc.get("enabled", True) and not os.path.isfile(path) \
-                and os.path.basename(path) == BUILTIN_MODEL["file"]:
+        if not yc.get("enabled", True) or os.path.basename(path) != BUILTIN_MODEL["file"]:
+            return          # 用自己訓練、另外命名的模型：不干涉
+        if not os.path.isfile(path):
             self.offer_model_update("這台電腦還沒有 YOLO 模型檔。")
+            return
+        if yc.get("model_declined") == BUILTIN_MODEL["sha256"]:
+            return
+
+        def worker():
+            # 程式更新不會覆寫已存在的模型；開啟時比對內建模型的校驗碼，舊版（例如只有怪物）就詢問要不要更新
+            try:
+                same = file_sha256(path) == BUILTIN_MODEL["sha256"]
+            except OSError:
+                return
+            if not same:
+                log(f"YOLO 模型和內建版本（{BUILTIN_MODEL['version']}）不同")
+                self.ui(lambda: self.offer_model_update(
+                    f"目前的 YOLO 模型（{os.path.basename(path)}）不是最新的內建版本（{BUILTIN_MODEL['version']}），"
+                    "可能是較舊、只認得怪物的模型；也可能是你自己重新訓練的。", remember_no=True))
+        threading.Thread(target=worker, daemon=True).start()
 
     def update_yolo_model_label(self):
         if not hasattr(self, "lbl_yolo_model"):
@@ -7471,6 +7505,8 @@ class App:
             return
         rect = self.vision.rect
         origin = (rect[0], rect[1]) if rect else None
+        size = (rect[2], rect[3]) if rect and len(rect) >= 4 else None
+        play_mouse = None        # 有滑鼠點擊時才問一次（多個檔案共用同一個答案）
         p = self.vision.get_pos()
         set_start = bool(p) and messagebox.askyesno(
             "TinyTask 起點",
@@ -7490,6 +7526,29 @@ class App:
             if rec is None:
                 errors.append(f"{os.path.basename(path)}：{note}")
                 continue
+            clicks = [e for e in rec["events"] if isinstance(e, dict) and e.get("kind") == "mouse"]
+            if clicks:
+                outside = sum(1 for e in clicks if e.get("down") and size and not (
+                    0 <= e["x"] < size[0] and 0 <= e["y"] < size[1]))
+                if play_mouse is None:
+                    n = sum(1 for e in clicks if e.get("down"))
+                    warn = (f"\n\n⚠ 其中 {outside} 次點在目前遊戲視窗外面，錄製後視窗多半移動過或解析度／縮放（DPI）不同。"
+                            if outside else "")
+                    play_mouse = messagebox.askyesno(
+                        "TinyTask 滑鼠點擊",
+                        f"「{os.path.basename(path)}」有 {n} 次滑鼠點擊。\n\n"
+                        "點擊位置是用「目前遊戲視窗的位置」換算的。錄製之後如果移動過遊戲視窗、改過解析度或 Windows 縮放，點擊會偏掉。"
+                        f"{warn}\n\n是：播放滑鼠點擊（錄製後視窗沒動過）\n否：只播放鍵盤，不點滑鼠",
+                        default="no" if outside else "yes", parent=self.root)
+                if not play_mouse:
+                    rec["events"] = [e for e in rec["events"] if not (isinstance(e, dict) and e.get("kind") == "mouse")]
+                    if not rec["events"]:
+                        errors.append(f"{os.path.basename(path)}：只有滑鼠點擊，但選了不播放滑鼠點擊")
+                        continue
+                    rec["duration"] = round(max(e[0] for e in rec["events"]), 2)
+                    note = "；".join(x for x in (note, f"略過 {sum(1 for e in clicks if e.get('down'))} 次滑鼠點擊") if x)
+                elif outside:
+                    note = "；".join(x for x in (note, f"{outside} 次點擊在視窗外") if x)
             rec["name"] = os.path.splitext(os.path.basename(path))[0]
             rec["play_mode"] = "record"
             if set_start:

@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.14"
+APP_VERSION = "v4.1.15"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -208,7 +208,7 @@ BUILTIN_MODEL = {
     "file": "monster_current_map_v2.pt",
     "version": "map_multiclass_v4",
     "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
-    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.14/monster_current_map_v2.pt",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.15/monster_current_map_v2.pt",
 }
 
 
@@ -731,6 +731,92 @@ def activate_window(hwnd):
 
 def is_foreground(hwnd):
     return IS_WIN and hwnd and user32.GetForegroundWindow() == hwnd
+
+
+# 背景運行測試用：不經過實體鍵盤，把按鍵訊息直接寄給遊戲視窗（不讀寫記憶體、不注入）
+_POST_VK = {"ctrl": 0x11, "rctrl": 0x11, "alt": 0x12, "ralt": 0x12, "shift": 0x10, "rshift": 0x10}
+
+
+def post_key(hwnd, name, up=False, repeat=False):
+    """PostMessage 送 WM_KEYDOWN／WM_KEYUP（Alt 用 WM_SYSKEY*）。回傳是否寄出"""
+    if not IS_WIN or not hwnd:
+        return False
+    name = name.lower().strip()
+    vk = _POST_VK.get(name, VK_NAMES.get(name))
+    if vk is None or name not in SCANCODES:
+        raise ValueError(f"不支援的按鍵：{name}")
+    sc, ext = SCANCODES[name]
+    lparam = 1 | (sc << 16) | ((1 << 24) if ext else 0)
+    if up:
+        lparam |= (1 << 30) | (1 << 31)
+    elif repeat:
+        lparam |= (1 << 30)
+    sys_key = name in ("alt", "ralt")
+    msg = (0x105 if up else 0x104) if sys_key else (0x101 if up else 0x100)
+    pm = user32.PostMessageW
+    pm.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    pm.restype = wintypes.BOOL
+    return bool(pm(hwnd, msg, vk, lparam))
+
+
+def printwindow_grab(hwnd, flags=3):
+    """向視窗要它自己的畫面（視窗被蓋住也可以；DirectX 遊戲可能回傳全黑）。
+    flags：1＝只要客戶區、2＝PW_RENDERFULLCONTENT。回傳客戶區 BGR 影像或 None"""
+    if not IS_WIN or not hwnd:
+        return None
+    gdi32 = ctypes.windll.gdi32
+    vp = ctypes.c_void_p
+    user32.GetDC.restype = vp
+    user32.GetDC.argtypes = [wintypes.HWND]
+    user32.ReleaseDC.argtypes = [wintypes.HWND, vp]
+    user32.PrintWindow.argtypes = [wintypes.HWND, vp, wintypes.UINT]
+    user32.PrintWindow.restype = wintypes.BOOL
+    gdi32.CreateCompatibleDC.restype = vp
+    gdi32.CreateCompatibleDC.argtypes = [vp]
+    gdi32.CreateCompatibleBitmap.restype = vp
+    gdi32.CreateCompatibleBitmap.argtypes = [vp, ctypes.c_int, ctypes.c_int]
+    gdi32.SelectObject.restype = vp
+    gdi32.SelectObject.argtypes = [vp, vp]
+    gdi32.DeleteObject.argtypes = [vp]
+    gdi32.DeleteDC.argtypes = [vp]
+    gdi32.GetDIBits.argtypes = [vp, vp, wintypes.UINT, wintypes.UINT, vp, vp, wintypes.UINT]
+    _, _, w, h = client_rect(hwnd)
+    if w <= 0 or h <= 0:
+        return None
+    hdc_win = user32.GetDC(hwnd)
+    hdc = gdi32.CreateCompatibleDC(hdc_win)
+    bmp = gdi32.CreateCompatibleBitmap(hdc_win, w, h)
+    old = gdi32.SelectObject(hdc, bmp)
+    try:
+        if not user32.PrintWindow(hwnd, hdc, flags):
+            return None
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize", wintypes.DWORD), ("biWidth", ctypes.c_long), ("biHeight", ctypes.c_long),
+                        ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                        ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", ctypes.c_long),
+                        ("biYPelsPerMeter", ctypes.c_long), ("biClrUsed", wintypes.DWORD),
+                        ("biClrImportant", wintypes.DWORD)]
+        bi = BITMAPINFOHEADER()
+        bi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bi.biWidth, bi.biHeight = w, -h          # 負的高度＝由上往下
+        bi.biPlanes, bi.biBitCount = 1, 32
+        buf = ctypes.create_string_buffer(w * h * 4)
+        if not gdi32.GetDIBits(hdc, bmp, 0, h, buf, ctypes.byref(bi), 0):
+            return None
+        return np.ascontiguousarray(np.frombuffer(buf, np.uint8).reshape(h, w, 4)[:, :, :3])
+    finally:
+        gdi32.SelectObject(hdc, old)
+        gdi32.DeleteObject(bmp)
+        gdi32.DeleteDC(hdc)
+        user32.ReleaseDC(hwnd, hdc_win)
+
+
+def compare_shots(a, b):
+    """兩張畫面差多少（0＝一樣）；尺寸不同回傳 None"""
+    if a is None or b is None or a.shape != b.shape:
+        return None
+    return float(cv2.absdiff(a, b).mean())
 
 
 def player_candidates(minimap_bgr, low, high, min_area=2):
@@ -5776,7 +5862,171 @@ class App:
         ttk.Button(pick, text="掃描", width=5, command=self.refresh_window_list).pack(side="left", padx=(4, 0))
         ttk.Button(pick, text="使用", width=5, command=self.use_selected_window).pack(side="left", padx=(4, 0))
         hint(box2, "標題只要包含部分文字即可；找不到遊戲時，從下拉清單選取遊戲視窗按「使用」。", pady=(3, 0))
+        bg = ttk.Frame(box2)
+        bg.pack(fill="x", pady=(4, 0))
+        ttk.Button(bg, text="背景運行測試", command=self.background_test).pack(side="left")
+        ttk.Label(bg, text="測遊戲不在前景時，按鍵與截圖能不能用", style="Hint.TLabel").pack(side="left", padx=(6, 0))
         self.refresh_window_list()
+
+    def background_test(self):
+        """遊戲不在前景時：①寄送按鍵（左右走、跳、Buff）角色會不會動 ②PrintWindow 截得到畫面嗎"""
+        if not IS_WIN:
+            self.notify("背景運行測試只能在 Windows 上執行。", error=True)
+            return
+        if self.bot.active.is_set():
+            self.notify("請先停止掛機再測試。", error=True)
+            return
+        hwnd = self.vision.hwnd
+        if not hwnd:
+            self.notify("找不到遊戲視窗，請先確認視窗標題。", error=True)
+            return
+        if not messagebox.askokcancel(
+                "背景運行測試",
+                "測試時遊戲會「不在前景」（本工具在前景），由工具把按鍵直接寄給遊戲視窗：\n"
+                "向右走 → 向左走 → 跳一下 → 放第一個 Buff，並向遊戲要一張截圖。\n\n"
+                "請先：\n"
+                "• 讓角色站在平地、左右有空間，旁邊沒有怪\n"
+                "• 把本工具和遊戲並排，遊戲畫面不要被蓋住（才能用小地圖看角色有沒有動）\n"
+                "• 測試約 6 秒，期間不要點遊戲、不要碰鍵盤\n\n按「確定」後 2 秒開始。",
+                parent=self.root):
+            return
+        self.root.lift()
+        try:
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+        threading.Thread(target=self._background_test_worker, args=(hwnd,), daemon=True).start()
+
+    def _background_test_worker(self, hwnd):
+        lines, saved = [], []
+        keys = self.cfg["keys"]
+        sent = []
+
+        def say(t):
+            self.ui(lambda t=t: self.lbl_status.config(text=t) if hasattr(self, "lbl_status") else None)
+
+        def fg_guard():
+            if is_foreground(hwnd):
+                raise RuntimeError("遊戲變成前景了（測試中點到遊戲？），這次結果不準，請重測")
+
+        def hold(name, sec):
+            post_key(hwnd, name)
+            sent.append(name)
+            end = time.time() + sec
+            while time.time() < end:
+                time.sleep(0.033)
+                fg_guard()
+                post_key(hwnd, name, repeat=True)
+            post_key(hwnd, name, up=True)
+            sent.remove(name)
+
+        try:
+            for n in (2, 1):
+                say(f"背景運行測試：{n} 秒後開始…")
+                time.sleep(1)
+            if is_foreground(hwnd):
+                raise RuntimeError("遊戲在前景，測不出背景的效果；請按測試後不要再點遊戲")
+            log("背景運行測試開始（遊戲不在前景）")
+            # ① 截圖
+            screen = self.vision.grab_client()
+            shot = None
+            for flags in (3, 1):
+                try:
+                    shot = printwindow_grab(hwnd, flags)
+                except Exception as e:
+                    log(f"PrintWindow 失敗：{e}", "warn")
+                    shot = None
+                if shot is not None and float(shot.std()) > 6:
+                    break
+            os.makedirs(DIAG_DIR, exist_ok=True)
+            for img, fn in ((screen, "背景測試_螢幕截圖.png"), (shot, "背景測試_向視窗要圖.png")):
+                if img is not None:
+                    imwrite_unicode(os.path.join(DIAG_DIR, fn), img)
+                    saved.append(fn)
+            diff = compare_shots(screen, shot)
+            if shot is None:
+                cap_ok = False
+                lines.append("✘ 畫面：向遊戲視窗要圖失敗（PrintWindow 不支援）")
+            elif float(shot.std()) <= 6:
+                cap_ok = False
+                lines.append("✘ 畫面：向遊戲視窗要到的是一片黑／單色（DirectX 畫面拿不到）")
+            elif diff is not None and diff > 30:
+                cap_ok = None
+                lines.append(f"△ 畫面：拿得到圖，但和螢幕上看到的差很多（差異 {diff:.0f}），請打開 diag 的兩張圖比對")
+            else:
+                cap_ok = True
+                lines.append("✔ 畫面：遊戲被蓋住時也拿得到畫面" + (f"（和螢幕差異 {diff:.0f}）" if diff is not None else ""))
+            # ② 按鍵
+            p0 = self.vision.get_pos()
+            if p0 is None:
+                lines.append("△ 小地圖看不到角色座標：按鍵效果請自己看角色有沒有動")
+            say("背景運行測試：向右走…")
+            hold(keys["right"], 0.9)
+            time.sleep(0.3)
+            p1 = self.vision.get_pos()
+            say("背景運行測試：向左走…")
+            hold(keys["left"], 0.9)
+            time.sleep(0.3)
+            p2 = self.vision.get_pos()
+            say("背景運行測試：跳…")
+            y_min = p2[1] if p2 else None
+            post_key(hwnd, keys["jump"])
+            time.sleep(0.08)
+            post_key(hwnd, keys["jump"], up=True)
+            end = time.time() + 0.8
+            while time.time() < end:
+                fg_guard()
+                q = self.vision.get_pos()
+                if q and y_min is not None:
+                    y_min = min(y_min, q[1])
+                time.sleep(0.03)
+            walk_ok = jump_ok = None
+            if p0 and p1 and p2:
+                walk_ok = p1[0] > p0[0] and p2[0] < p1[0]
+                lines.append(("✔" if walk_ok else "✘") + f" 走路：右 {p1[0] - p0[0]:+d} 格、左 {p2[0] - p1[0]:+d} 格")
+            if y_min is not None and p2:
+                jump_ok = y_min < p2[1]
+                lines.append(("✔" if jump_ok else "✘") + f" 跳躍：最高往上 {p2[1] - y_min} 格")
+            # ③ Buff
+            sk = next((x for x in self.cfg["skills"] if x.get("enabled")), None)
+            if sk:
+                say(f"背景運行測試：放 Buff「{sk['name']}」…")
+                time.sleep(0.5)
+                post_key(hwnd, sk["key"])
+                time.sleep(0.1)
+                post_key(hwnd, sk["key"], up=True)
+                time.sleep(max(0.8, float(sk.get("delay", 0.6))))
+                if sk.get("icon"):
+                    st = self.bot.icon_state(sk)
+                    lines.append({True: "✔", False: "✘", None: "△"}[st] + f" Buff「{sk['name']}」："
+                                 + {True: "畫面上有它的圖示（如果原本就有，請等它消失後再測一次）",
+                                    False: "沒看到圖示", None: "無法判斷"}[st])
+                else:
+                    lines.append(f"△ Buff「{sk['name']}」：沒有框圖示，請自己看角色剛剛有沒有放技能")
+            fg_guard()
+            keys_ok = walk_ok and jump_ok
+            if keys_ok and cap_ok:
+                verdict = "結論：你的客戶端在背景時按鍵和截圖都能用，可以做「背景模式」。"
+            elif keys_ok:
+                verdict = "結論：背景按鍵可以用，但截圖拿不到；背景模式只能在遊戲沒被蓋住（但不在前景）時用。"
+            elif walk_ok is False or jump_ok is False:
+                verdict = ("結論：遊戲不接受寄送的按鍵（多半是用 DirectInput 讀實體鍵盤），沒辦法在背景操作；"
+                           "要同時掛兩隻，建議第二隻開在虛擬機或另一台電腦。")
+            else:
+                verdict = "結論：小地圖看不到角色，無法自動判斷按鍵；請看角色剛剛有沒有右走、左走、跳。"
+            lines.append(verdict)
+        except Exception as e:
+            lines.append(f"✘ 測試中斷：{e}")
+        finally:
+            for k in list(sent):
+                try:
+                    post_key(hwnd, k, up=True)
+                except Exception:
+                    pass
+        for ln in lines:
+            log("背景運行測試：" + ln, "warn" if ln.startswith("✘") else "info")
+        text = "\n".join(lines) + (f"\n\n截圖存在 diag 資料夾：{'、'.join(saved)}" if saved else "")
+        self.ui(lambda: (say(""), messagebox.showinfo("背景運行測試結果", text, parent=self.root)))
 
     def build_options(self, f):
         box2 = section(f, "基礎")

@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.15"
+APP_VERSION = "v4.1.16"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -208,7 +208,7 @@ BUILTIN_MODEL = {
     "file": "monster_current_map_v2.pt",
     "version": "map_multiclass_v4",
     "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
-    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.15/monster_current_map_v2.pt",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.16/monster_current_map_v2.pt",
 }
 
 
@@ -737,26 +737,42 @@ def is_foreground(hwnd):
 _POST_VK = {"ctrl": 0x11, "rctrl": 0x11, "alt": 0x12, "ralt": 0x12, "shift": 0x10, "rshift": 0x10}
 
 
-def post_key(hwnd, name, up=False, repeat=False):
-    """PostMessage 送 WM_KEYDOWN／WM_KEYUP（Alt 用 WM_SYSKEY*）。回傳是否寄出"""
+def post_msg(hwnd, msg, wparam=0, lparam=0):
+    pm = user32.PostMessageW
+    pm.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    pm.restype = wintypes.BOOL
+    return bool(pm(hwnd, msg, wparam, lparam))
+
+
+def post_activate(hwnd, active=True):
+    """寄「視窗啟用／取得焦點」訊息給遊戲（只是訊息，不會真的把視窗切到前景）。
+    有些遊戲在自己不是前景時會忽略按鍵，先告訴它「你是作用中」就會收"""
+    if not IS_WIN or not hwnd:
+        return False
+    post_msg(hwnd, 0x001C, 1 if active else 0, 0)        # WM_ACTIVATEAPP
+    post_msg(hwnd, 0x0006, 1 if active else 0, 0)        # WM_ACTIVATE（WA_ACTIVE／WA_INACTIVE）
+    return post_msg(hwnd, 0x0007 if active else 0x0008, 0, 0)   # WM_SETFOCUS／WM_KILLFOCUS
+
+
+def post_key(hwnd, name, up=False, repeat=False, as_sys=None, ext=None):
+    """PostMessage 送 WM_KEYDOWN／WM_KEYUP（Alt 用 WM_SYSKEY*）。回傳是否寄出。
+    as_sys＝強制用（True）或不用（False）WM_SYSKEY*；ext＝強制設定延伸鍵旗標"""
     if not IS_WIN or not hwnd:
         return False
     name = name.lower().strip()
     vk = _POST_VK.get(name, VK_NAMES.get(name))
     if vk is None or name not in SCANCODES:
         raise ValueError(f"不支援的按鍵：{name}")
-    sc, ext = SCANCODES[name]
+    sc, ext0 = SCANCODES[name]
+    ext = ext0 if ext is None else ext
     lparam = 1 | (sc << 16) | ((1 << 24) if ext else 0)
     if up:
         lparam |= (1 << 30) | (1 << 31)
     elif repeat:
         lparam |= (1 << 30)
-    sys_key = name in ("alt", "ralt")
+    sys_key = name in ("alt", "ralt") if as_sys is None else as_sys
     msg = (0x105 if up else 0x104) if sys_key else (0x101 if up else 0x100)
-    pm = user32.PostMessageW
-    pm.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-    pm.restype = wintypes.BOOL
-    return bool(pm(hwnd, msg, vk, lparam))
+    return post_msg(hwnd, msg, vk, lparam)
 
 
 def printwindow_grab(hwnd, flags=3):
@@ -5883,11 +5899,11 @@ class App:
         if not messagebox.askokcancel(
                 "背景運行測試",
                 "測試時遊戲會「不在前景」（本工具在前景），由工具把按鍵直接寄給遊戲視窗：\n"
-                "向右走 → 向左走 → 跳一下 → 放第一個 Buff，並向遊戲要一張截圖。\n\n"
+                "向右走（找出遊戲收哪種寄法）→ 走回來 → 跳一下 → 放第一個 Buff，並向遊戲要一張截圖。\n\n"
                 "請先：\n"
                 "• 讓角色站在平地、左右有空間，旁邊沒有怪\n"
                 "• 把本工具和遊戲並排，遊戲畫面不要被蓋住（才能用小地圖看角色有沒有動）\n"
-                "• 測試約 6 秒，期間不要點遊戲、不要碰鍵盤\n\n按「確定」後 2 秒開始。",
+                "• 測試約 10 秒（會用幾種寄法輪流試向右走），期間不要點遊戲、不要碰鍵盤\n\n按「確定」後 2 秒開始。",
                 parent=self.root):
             return
         self.root.lift()
@@ -5956,23 +5972,59 @@ class App:
             else:
                 cap_ok = True
                 lines.append("✔ 畫面：遊戲被蓋住時也拿得到畫面" + (f"（和螢幕差異 {diff:.0f}）" if diff is not None else ""))
-            # ② 按鍵
-            p0 = self.vision.get_pos()
-            if p0 is None:
-                lines.append("△ 小地圖看不到角色座標：按鍵效果請自己看角色有沒有動")
-            say("背景運行測試：向右走…")
-            hold(keys["right"], 0.9)
-            time.sleep(0.3)
-            p1 = self.vision.get_pos()
-            say("背景運行測試：向左走…")
-            hold(keys["left"], 0.9)
-            time.sleep(0.3)
-            p2 = self.vision.get_pos()
+            # ② 按鍵：同一個「向右走」用幾種寄法試，找出遊戲收哪一種
+            variants = [
+                ("WM_KEYDOWN", {}, False),
+                ("WM_KEYDOWN（方向鍵不帶延伸旗標）", {"ext": False}, False),
+                ("WM_SYSKEYDOWN（和 Alt 一樣的訊息）", {"as_sys": True}, False),
+                ("先寄「視窗啟用」＋WM_KEYDOWN", {}, True),
+                ("先寄「視窗啟用」＋WM_SYSKEYDOWN", {"as_sys": True}, True),
+            ]
+            if self.vision.get_pos() is None:
+                lines.append("△ 小地圖看不到角色座標：無法自動判斷按鍵，請看角色有沒有動")
+            walk_ok, best, activated = None, None, False
+
+            def hold_v(name, sec, opt):
+                post_key(hwnd, name, **opt)
+                sent.append((name, opt))
+                end = time.time() + sec
+                while time.time() < end:
+                    time.sleep(0.033)
+                    fg_guard()
+                    post_key(hwnd, name, repeat=True, **opt)
+                post_key(hwnd, name, up=True, **opt)
+                sent.remove((name, opt))
+
+            for label, opt, act in variants:
+                if act and not activated:
+                    post_activate(hwnd, True)
+                    activated = True
+                    time.sleep(0.15)
+                say(f"背景運行測試：向右走（{label}）…")
+                p0 = self.vision.get_pos()
+                hold_v(keys["right"], 0.7, opt)
+                time.sleep(0.3)
+                p1 = self.vision.get_pos()
+                if p0 is None or p1 is None:
+                    continue
+                dx = p1[0] - p0[0]
+                ok = dx > 0
+                lines.append(("✔" if ok else "✘") + f" 走路［{label}］：右 {dx:+d} 格")
+                if ok:
+                    walk_ok = True
+                    best = (label, opt, act)
+                    hold_v(keys["left"], 0.7, opt)          # 走回原位
+                    time.sleep(0.3)
+                    break
+                walk_ok = False
+            # 跳（Alt）
+            jopt = best[1] if best else {}
             say("背景運行測試：跳…")
+            p2 = self.vision.get_pos()
             y_min = p2[1] if p2 else None
-            post_key(hwnd, keys["jump"])
+            post_key(hwnd, keys["jump"], **jopt)
             time.sleep(0.08)
-            post_key(hwnd, keys["jump"], up=True)
+            post_key(hwnd, keys["jump"], up=True, **jopt)
             end = time.time() + 0.8
             while time.time() < end:
                 fg_guard()
@@ -5980,37 +6032,40 @@ class App:
                 if q and y_min is not None:
                     y_min = min(y_min, q[1])
                 time.sleep(0.03)
-            walk_ok = jump_ok = None
-            if p0 and p1 and p2:
-                walk_ok = p1[0] > p0[0] and p2[0] < p1[0]
-                lines.append(("✔" if walk_ok else "✘") + f" 走路：右 {p1[0] - p0[0]:+d} 格、左 {p2[0] - p1[0]:+d} 格")
+            jump_ok = None
             if y_min is not None and p2:
                 jump_ok = y_min < p2[1]
                 lines.append(("✔" if jump_ok else "✘") + f" 跳躍：最高往上 {p2[1] - y_min} 格")
-            # ③ Buff
+            # ③ Buff（用剛才走得動的寄法；都走不動就用一般 WM_KEYDOWN）
             sk = next((x for x in self.cfg["skills"] if x.get("enabled")), None)
             if sk:
+                bopt = best[1] if best else {}
+                time.sleep(0.6)
+                before = self.bot.icon_state(sk) if sk.get("icon") else None
                 say(f"背景運行測試：放 Buff「{sk['name']}」…")
-                time.sleep(0.5)
-                post_key(hwnd, sk["key"])
+                post_key(hwnd, sk["key"], **bopt)
                 time.sleep(0.1)
-                post_key(hwnd, sk["key"], up=True)
+                post_key(hwnd, sk["key"], up=True, **bopt)
                 time.sleep(max(0.8, float(sk.get("delay", 0.6))))
                 if sk.get("icon"):
                     st = self.bot.icon_state(sk)
-                    lines.append({True: "✔", False: "✘", None: "△"}[st] + f" Buff「{sk['name']}」："
-                                 + {True: "畫面上有它的圖示（如果原本就有，請等它消失後再測一次）",
-                                    False: "沒看到圖示", None: "無法判斷"}[st])
+                    if before:
+                        lines.append(f"△ Buff「{sk['name']}」：放之前圖示就在了，判斷不出來（等這個 Buff 消失後再測）")
+                    else:
+                        lines.append({True: "✔", False: "✘", None: "△"}[st] + f" Buff「{sk['name']}」："
+                                     + {True: "放完圖示出現了", False: "沒看到圖示", None: "無法判斷"}[st])
                 else:
                     lines.append(f"△ Buff「{sk['name']}」：沒有框圖示，請自己看角色剛剛有沒有放技能")
+            if activated:
+                post_activate(hwnd, False)
             fg_guard()
             keys_ok = walk_ok and jump_ok
             if keys_ok and cap_ok:
-                verdict = "結論：你的客戶端在背景時按鍵和截圖都能用，可以做「背景模式」。"
+                verdict = f"結論：背景按鍵（{best[0]}）和截圖都能用，可以做「背景模式」。"
             elif keys_ok:
-                verdict = "結論：背景按鍵可以用，但截圖拿不到；背景模式只能在遊戲沒被蓋住（但不在前景）時用。"
-            elif walk_ok is False or jump_ok is False:
-                verdict = ("結論：遊戲不接受寄送的按鍵（多半是用 DirectInput 讀實體鍵盤），沒辦法在背景操作；"
+                verdict = f"結論：背景按鍵（{best[0]}）可以用，但截圖拿不到；背景模式只能在遊戲沒被蓋住（但不在前景）時用。"
+            elif walk_ok is False:
+                verdict = ("結論：幾種寄法遊戲都不讓角色走路（多半是用 DirectInput 讀實體鍵盤），沒辦法在背景操作；"
                            "要同時掛兩隻，建議第二隻開在虛擬機或另一台電腦。")
             else:
                 verdict = "結論：小地圖看不到角色，無法自動判斷按鍵；請看角色剛剛有沒有右走、左走、跳。"
@@ -6020,7 +6075,10 @@ class App:
         finally:
             for k in list(sent):
                 try:
-                    post_key(hwnd, k, up=True)
+                    if isinstance(k, tuple):
+                        post_key(hwnd, k[0], up=True, **k[1])
+                    else:
+                        post_key(hwnd, k, up=True)
                 except Exception:
                     pass
         for ln in lines:

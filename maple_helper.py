@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.1.16"
+APP_VERSION = "v4.2.0"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -208,7 +208,7 @@ BUILTIN_MODEL = {
     "file": "monster_current_map_v2.pt",
     "version": "map_multiclass_v4",
     "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
-    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.1.16/monster_current_map_v2.pt",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.2.0/monster_current_map_v2.pt",
 }
 
 
@@ -3924,65 +3924,70 @@ MODE_ORDER = ["anchor", "buff"]
 
 
 class Collapsible(ttk.Frame):
-    """可摺疊區塊：預設收起，點標題展開"""
+    """進階設定：主畫面只顯示一行連結，點了才跳出小視窗（主視窗固定大小，不會因為展開而需要捲動）。
+    內容照舊放在 .body 裡"""
 
     def __init__(self, parent, title="進階設定", opened=False, **kw):
         super().__init__(parent, **kw)
         self._title = title
-        self._open = opened
-        self._hdr = ttk.Label(self, style="Link.TLabel", cursor="hand2")
+        self._open = False
+        self._hdr = ttk.Label(self, style="Link.TLabel", cursor="hand2", text="⚙ " + title + "…")
         self._hdr.pack(anchor="w", pady=(2, 0))
         self._hdr.bind("<Button-1>", lambda e: self.toggle())
-        self.body = ttk.Frame(self, padding=(14, 2, 0, 4))
-        self._sync()
+        self.win = tk.Toplevel(self)
+        self.win.withdraw()
+        self.win.title(title.split("：")[0] if "：" in title else title)
+        self.win.resizable(False, False)
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+        bar = ttk.Frame(self.win, padding=(12, 0, 12, 10))
+        bar.pack(side="bottom", fill="x")
+        ttk.Button(bar, text="關閉", command=self.close).pack(side="right")
+        ttk.Label(bar, text="修改後自動儲存", style="Hint.TLabel").pack(side="left")
+        self.body = ttk.Frame(self.win, padding=(12, 10, 12, 6))
+        self.body.pack(fill="both", expand=True)
+        if opened:
+            self.after(200, self.open)
+
+    def open(self):
+        self._open = True
+        top = self.winfo_toplevel()
+        try:
+            self.win.transient(top)
+        except tk.TclError:
+            pass
+        self.win.update_idletasks()
+        x = self._hdr.winfo_rootx()
+        y = self._hdr.winfo_rooty() + self._hdr.winfo_height() + 4
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
+        self.win.geometry(f"+{max(0, min(x, sw - w - 10))}+{max(0, min(y, sh - h - 60))}")
+        self.win.deiconify()
+        self.win.lift()
+        self.win.focus_set()
+
+    def close(self):
+        self._open = False
+        try:
+            self.win.focus_set()      # 讓正在編輯的欄位觸發 FocusOut 存檔
+            self.win.update()
+        except tk.TclError:
+            pass
+        self.win.withdraw()
 
     def toggle(self):
-        self._open = not self._open
-        self._sync()
-
-    def _sync(self):
-        self._hdr.config(text=("▾ " if self._open else "▸ ") + self._title)
-        if self._open:
-            self.body.pack(fill="x")
-        else:
-            self.body.pack_forget()
+        self.close() if self._open else self.open()
 
 
 class ScrollFrame(ttk.Frame):
-    """可上下捲動的區域（滑鼠滾輪可用）"""
+    """（v4.2.0 起不捲動）固定大小的內容區：內容放在 .inner；介面固定大小，所有內容都排在畫面內"""
 
     def __init__(self, parent, **kw):
         super().__init__(parent, **kw)
-        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
-        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.inner = ttk.Frame(self.canvas)
-        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.vsb.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.vsb.pack(side="right", fill="y")
-        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self._win, width=e.width))
-        self.bind_all("<MouseWheel>", self._wheel, add="+")
-        self.bind_all("<Button-4>", lambda e: self._scroll(-1), add="+")
-        self.bind_all("<Button-5>", lambda e: self._scroll(1), add="+")
-
-    def _under_mouse(self):
-        w = self.winfo_containing(*self.winfo_pointerxy())
-        while w is not None:
-            if w is self:
-                return True
-            w = getattr(w, "master", None)
-        return False
-
-    def _scroll(self, step):
-        if self._under_mouse():
-            self.canvas.yview_scroll(step, "units")
-
-    def _wheel(self, e):
-        self._scroll(-1 if e.delta > 0 else 1)
+        self.inner = ttk.Frame(self)
+        self.inner.pack(fill="both", expand=True)
 
     def to_top(self):
-        self.canvas.yview_moveto(0)
+        pass
 
 
 def autowrap(lbl, pad=8):
@@ -4112,11 +4117,21 @@ class App:
         root.title(f"楓之谷輔助工具 {APP_VERSION}")
         init_ui_metrics(root)
         wl, wt, ww, wh = work_area(root)
+        # 視窗固定大小（設計尺寸 1020×700）；螢幕放不下時（例如筆電 150% 縮放），整個介面等比例縮小，
+        # 內容一樣全部排得下，不需要捲動
+        global UI_SCALE
+        fit = min(1.0, (ww - 20) / max(1, px(1020)), (wh - 40) / max(1, px(700)))
+        if fit < 0.999:
+            UI_SCALE = max(0.6, UI_SCALE * fit)
+            try:
+                root.tk.call("tk", "scaling", float(root.tk.call("tk", "scaling")) * fit)
+            except tk.TclError:
+                pass
         # 左邊設定分頁＋右邊配置／日誌，預設放在螢幕右側，避免蓋住遊戲左上角的小地圖
         w = min(px(1020), ww - 20)
         h = min(px(700), wh - 40)
         root.geometry(f"{w}x{h}+{wl + max(0, ww - w - 20)}+{wt + 10}")
-        root.minsize(min(px(720), ww - 20), min(px(480), wh - 40))
+        root.resizable(False, False)                # 固定大小：所有內容都排在畫面內，不用捲動
         root.attributes("-topmost", False)          # 一律不置頂開啟，避免蓋住遊戲
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._base_tk_scaling = float(root.tk.call("tk", "scaling"))
@@ -4147,22 +4162,23 @@ class App:
         body.add(right, weight=0)
         self.side_frame = right
         self._side_compact = None
-        self._side_pref = int(self.cfg.get("side_width") or px(300))   # 使用者拖曳後的右側寬度
+        self._side_pref = px(300)                   # 右側欄固定寬度（不能拖曳）
         self._last_root_w = None
         self.build_side(right)          # 先建右側（建分頁時可能就會呼叫 notify）
         right.bind("<Configure>", self._on_side_resize, add="+")
-        body.bind("<ButtonRelease-1>", self._on_sash_drag, add="+")
+        for ev in ("<Button-1>", "<B1-Motion>", "<ButtonRelease-1>", "<Motion>"):
+            body.bind(ev, lambda e: "break")         # 中間分隔線不能拖曳
         self.nb = ttk.Notebook(left)
         self.nb.pack(fill="both", expand=True)
         self.nb.bind("<Configure>", self._fit_tab_titles, add="+")
         self.tabs = {}
         self._tab_titles = {}
         self._tabs_short = None
-        for key, title, builder, scroll in (("settings", "設定", self.build_settings, True),
+        for key, title, builder, scroll in (("settings", "設定", self.build_settings, False),
                                             ("map", "掛機地圖", self.build_home, False),
-                                            ("alarm", "警報", self.build_alarm, True),
-                                            ("yolo", "AI 辨識", self.build_yolo_dataset, True),
-                                            ("adv", "校正", self.build_detect_adv, True),
+                                            ("alarm", "警報", self.build_alarm, False),
+                                            ("yolo", "AI 辨識", self.build_yolo_dataset, False),
+                                            ("adv", "校正", self.build_detect_adv, False),
                                             ("setup", "首次設定", self.build_wizard, False)):
             if scroll:
                 outer = ScrollFrame(self.nb)
@@ -4781,7 +4797,7 @@ class App:
 
         mm = ttk.LabelFrame(f, text=" 小地圖 ", padding=(6, 4))
         mm.pack(fill="x", pady=(6, 6))
-        self.canvas = tk.Canvas(mm, height=px(130), bg="#1f2328", highlightthickness=0)
+        self.canvas = tk.Canvas(mm, height=px(120), bg="#1f2328", highlightthickness=0)
         self.canvas.pack(fill="x")
         self.canvas.bind("<Motion>", self.on_minimap_motion)
         self.canvas.bind("<Leave>", lambda _e: self.lbl_hover.config(text="游標座標 --"))
@@ -4790,16 +4806,31 @@ class App:
         self.lbl_legend = autowrap(ttk.Label(mm, text="", style="Hint.TLabel", justify="left"))
         self.lbl_legend.pack(fill="x", pady=(2, 0))
 
-        self.mode_scroll = ScrollFrame(f)
-        self.mode_scroll.pack(fill="both", expand=True)
-        host = self.mode_scroll.inner
-        self.pn = {
-            "anchor": self.build_anchor(host),
-            "buff": self.build_loot(host),
-        }
-        # 繩下定點／爬繩／跳台：兩種模式共用，放在模式設定下面
-        self.pn_patrol = self.build_patrol(host)
-        self.patrol_box.config(text=" 繩下定點（爬繩／跳台） ")
+        # 模式設定分成幾個分頁（定點：定點；BUFF 機：路線／繩組／撿物），整頁固定大小、不用捲動
+        self.mode_nb = ttk.Notebook(f)
+        self.mode_nb.pack(fill="both", expand=True)
+        pages = {}
+        for key in ("anchor", "route", "patrol", "loot"):
+            pages[key] = ttk.Frame(self.mode_nb, padding=(6, 4))
+        self.mode_pages = pages
+        self.build_anchor(pages["anchor"]).pack(fill="both", expand=True)
+        route_f, loot_f = self.build_loot(pages["route"], pages["loot"])
+        route_f.pack(fill="both", expand=True)
+        loot_f.pack(fill="both", expand=True)
+        self.pn_patrol = self.build_patrol(pages["patrol"])
+        self.pn_patrol.pack(fill="both", expand=True)
+        self.patrol_box.config(text=" 繩組（繩下定點／繩上定點／下跳點） ")
+        self.mode_page_titles = {"anchor": " 定點 ", "route": " 錄製路線 ", "patrol": " 繩組 ", "loot": " 撿物 "}
+        self.mode_page_sets = {"anchor": ["anchor"], "buff": ["route", "patrol", "loot"]}
+        for key in ("anchor", "route", "patrol", "loot"):
+            self.mode_nb.add(pages[key], text=self.mode_page_titles[key])
+        self.pn = {"anchor": pages["anchor"], "buff": pages["route"]}
+
+    def goto_mode_page(self):
+        """首次設定頁「到掛機地圖」：切到掛機地圖，並打開這個模式的第一個分頁（定點／錄製路線）"""
+        self.nb.select(self.tab_home)
+        mode = self.cfg.get("mode", "anchor")
+        self.mode_nb.select(self.mode_pages[self.mode_page_sets.get(mode, ["anchor"])[0]])
 
     def set_mode(self, key):
         if key != self.cfg.get("mode"):
@@ -4824,18 +4855,17 @@ class App:
             mode = "anchor"
             self.cfg["mode"] = mode
         self.lbl_mode_desc.config(text=MODE_INFO[mode][1])
-        for p in self.pn.values():
-            p.pack_forget()
-        self.pn_patrol.pack_forget()
-        self.pn[mode].pack(fill="x")
-        if mode == "buff":                    # 定點掛機不爬繩，不顯示繩下定點區
-            self.pn_patrol.pack(fill="x")
+        want = self.mode_page_sets[mode]          # 定點掛機不爬繩，不顯示繩組分頁
+        for key, page in self.mode_pages.items():
+            if key in want:
+                self.mode_nb.add(page)
+            else:
+                self.mode_nb.hide(page)
+        self.mode_nb.select(self.mode_pages[want[0]])
         if mode == "buff":
-            self.lbl_patrol_hint.config(text="一組＝「繩下定點」＋「繩上定點」（＋可選的下跳點）：站在繩子正下方按「＋ 繩下定點」，爬上去走到要停的位置，"
-                                             "按「＋ 繩上定點」（會配給清單選取的繩子，沒選就配給最後記錄的繩子）。"
-                                             "要從那裡跳下去，就站在要跳的位置按「＋ 下跳點」，跳下去後還要再跳就繼續按，會依序接在這一組後面。"
-                                             "沒有錄製全圖路線時，BUFF 機只在這些繩組之間隨機移動：走到繩下 → 爬上去 → 走到繩上定點，不攻擊。"
-                                             "要往下層時，有「下跳點」就優先在那裡下跳（比沿繩子爬下來快）。")
+            self.lbl_patrol_hint.config(text="一組＝繩下定點＋繩上定點（＋下跳點）：站在繩子正下方按「＋繩下定點」，爬上去走到要停的位置按「＋繩上定點」"
+                                             "（配給選取的繩子，沒選就配給最後記錄的）；要往下跳就站在跳點按「＋下跳點」，可依序接多個。"
+                                             "沒有錄製路線時，BUFF 機在這些繩組之間隨機移動、不攻擊；往下層會優先用下跳點。")
             if not self.btn_rec_point.winfo_manager():
                 self.btn_rec_point.pack(side="left", padx=(0, 6), before=self.btn_rec_rope)
         else:
@@ -4847,7 +4877,6 @@ class App:
         if mode == "buff":
             legend += "　青線＝錄製路徑　綠圈＝起點　粉圈＝終點　橘線＝自動讀取的繩子"
         self.lbl_legend.config(text="小地圖：" + legend)
-        self.mode_scroll.to_top()
 
     # ---------------- 定點掛機 ----------------
     def build_anchor(self, host):
@@ -4950,8 +4979,9 @@ class App:
         return f
 
     # ---------------- BUFF機 ----------------
-    def build_loot(self, host):
+    def build_loot(self, host, loot_host=None):
         f = ttk.Frame(host)
+        f2 = ttk.Frame(loot_host) if loot_host is not None else f
         macro = section(f, "整張地圖錄製", "錄下鍵盤、遊戲視窗內的滑鼠點擊，以及小地圖座標路徑。開始後會先放 Buff，再循環播放。")
         button_row(macro, [("＋ 錄製隨機路線", self.record_map_macro), ("匯入 TinyTask…", self.import_tinytask),
                            ("清除全部路線", self.clear_map_macro)])
@@ -4969,7 +4999,7 @@ class App:
         self.update_map_macro_label()
 
         lt = self.cfg["loot"]
-        box = section(f, "撿物", "移動時會一直連點撿物鍵；框選物品範本後，看到地上的物品會走過去撿。Buff 在「共用設定」設定。")
+        box = section(f2, "撿物", "移動時會一直連點撿物鍵；框選物品範本後，看到地上的物品會走過去撿。Buff 在「設定」頁設定。")
         self.loot_vars = {}
         self.var_loot_on = tk.BooleanVar(value=lt.get("enabled", True))
         ttk.Checkbutton(box, text="啟用撿物（取消＝BUFF 機只移動、放 Buff）", variable=self.var_loot_on,
@@ -4994,7 +5024,7 @@ class App:
                        ("pick_radius", "站上物品判定(px)"), ("max_tries", "撿不起來重試次數")],
                   lt, self.loot_vars, self.save_loot, width=6)
         self.update_loot_label()
-        return f
+        return (f, f2) if loot_host is not None else f
 
     # ---------------- 隨機巡邏（攻擊參數） ----------------
     def build_random(self, host):
@@ -5105,7 +5135,7 @@ class App:
         cols.bind("<Configure>", layout, add="+")
         layout()
         self.build_keys(c0)
-        self.build_skill(c1)
+        self.build_skill(c1, c0)          # 持續攻擊放左欄，右欄留給 Buff 表（技能多時才放得下）
         self.build_options(c1)
 
     def open_shared(self, key):
@@ -5122,6 +5152,17 @@ class App:
         return sorted((n for n in os.listdir(YOLO_IMAGES_DIR) if n.lower().endswith(".png")), reverse=True)
 
     def build_yolo_dataset(self, f):
+        sub = ttk.Notebook(f)
+        sub.pack(fill="both", expand=True)
+        self.yolo_nb = sub
+        pg_model = ttk.Frame(sub, padding=(6, 4))
+        pg_data = ttk.Frame(sub, padding=(6, 4))
+        sub.add(pg_model, text=" 模型與辨識 ")
+        sub.add(pg_data, text=" 收集與標註 ")
+        self._yolo_pages = (pg_model, pg_data)
+        self._build_yolo_dataset(pg_data, pg_model)
+
+    def _build_yolo_dataset(self, f, f_model):
         box = section(f, "怪物資料收集（實驗）",
                       "開始後會定時保存遊戲完整畫面。先收集怪物；之後選取圖片、框住每一隻怪物，即可產生 YOLO 訓練標註。")
         row = ttk.Frame(box)
@@ -5141,13 +5182,12 @@ class App:
         ttk.Button(row_b, text="匯入「把圖片丟這裡」", command=self.import_yolo_inbox).pack(side="left")
         ttk.Button(row_b, text="開啟該資料夾", command=self.open_yolo_inbox).pack(side="left", padx=(6, 0))
         ttk.Button(row_b, text="從影片擷取…", command=self.import_yolo_video).pack(side="left", padx=(6, 0))
-        hint(box, "更快的收集方式：① 用任何截圖工具截好的圖（png／jpg）丟進「把圖片丟這裡」資料夾，按匯入；"
-                  "② 用 OBS／顯示卡錄一段遊戲影片，按「從影片擷取」每隔幾秒取一張，畫面幾乎沒變的會自動略過。"
-                  "重複的圖片不會匯入兩次。", pady=(4, 0))
+        hint(box, "更快的收集方式：截好的圖（png／jpg）丟進「把圖片丟這裡」資料夾按匯入；或錄一段遊戲影片按「從影片擷取」，"
+                  "畫面幾乎沒變的會自動略過。重複的圖片不會匯入兩次。", pady=(4, 0))
         self.lbl_yolo_dataset = ttk.Label(box, text="", style="Hint.TLabel")
         self.lbl_yolo_dataset.pack(anchor="w", pady=(5, 0))
 
-        runtime = section(f, "YOLO 怪物辨識", "這張地圖的模型會優先用於怪物辨識；沒有模型或 YOLO 環境時會保留舊範本辨識。全自動戰鬥仍維持關閉。")
+        runtime = section(f_model, "YOLO 怪物辨識", "這張地圖的模型會優先用於怪物辨識；沒有模型或 YOLO 環境時會保留舊範本辨識。全自動戰鬥仍維持關閉。")
         yc = self.cfg.get("yolo", {})
         self.var_yolo_enabled = tk.BooleanVar(value=yc.get("enabled", True))
         self.var_yolo_rope_assist = tk.BooleanVar(value=yc.get("rope_assist", True))
@@ -5186,14 +5226,14 @@ class App:
                      state="readonly", width=8).pack(side="left")
         body = ttk.Frame(labels)
         body.pack(fill="both", expand=True)
-        self.lb_yolo_images = tk.Listbox(body, height=9, exportselection=False)
+        self.lb_yolo_images = tk.Listbox(body, height=5, exportselection=False)
         self.lb_yolo_images.pack(side="left", fill="both", expand=True)
         side = ttk.Frame(body)
         side.pack(side="left", fill="y", padx=(8, 0))
         ttk.Button(side, text="重新整理", command=self.refresh_yolo_dataset).pack(fill="x")
         ttk.Button(side, text="開始框選", command=self.annotate_yolo_image).pack(fill="x", pady=(6, 0))
         ttk.Button(side, text="下一張未標註", command=self.select_next_yolo_unlabeled).pack(fill="x", pady=(6, 0))
-        ttk.Button(side, text="用模型自動標註", command=self.auto_label_yolo).pack(fill="x", pady=(12, 0))
+        ttk.Button(side, text="用模型自動標註", command=self.auto_label_yolo).pack(fill="x", pady=(10, 0))
         ttk.Button(side, text="下一張待確認", command=self.select_next_yolo_auto).pack(fill="x", pady=(6, 0))
         self.refresh_yolo_dataset()
         self.update_yolo_model_label()
@@ -5695,8 +5735,8 @@ class App:
         win._image = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)))
         tk.Label(win, image=win._image).pack()
 
-    def build_skill(self, f):
-        box = section(f, "Buff／定時技能", "勾選即啟用；每隔設定秒數自動施放，按開始時會先各放一次。直接修改，自動儲存。「框圖示」：框選畫面右上角這個 Buff 的小圖示，放完會確認有沒有放出來（沒有就重放），圖示提早消失也會補放。")
+    def build_skill(self, f, f_attack=None):
+        box = section(f, "Buff／定時技能", "勾選即啟用，每隔設定秒數自動施放，按開始時先各放一次。「框圖示」＝框右上角 Buff 列的小圖示：確認有沒有放出來、消失時補放。")
         self.skill_grid = ttk.Frame(box)
         self.skill_grid.pack(fill="x")
         button_row(box, [("＋ 新增技能", self.add_skill)])
@@ -5709,7 +5749,7 @@ class App:
         ttk.Label(wait_row, text="秒才開始移動").pack(side="left")
         ew.bind("<FocusOut>", lambda _e: self.save_buff_wait())
         ew.bind("<Return>", lambda _e: self.save_buff_wait())
-        box2 = section(f, "持續攻擊", "路線的「等待」步驟中，依間隔一直按攻擊鍵。")
+        box2 = section(f_attack if f_attack is not None else f, "持續攻擊", "路線的「等待」步驟中，依間隔一直按攻擊鍵。")
         r = ttk.Frame(box2)
         r.pack(fill="x")
         self.var_atk = tk.BooleanVar(value=self.cfg["attack"]["enabled"])
@@ -5877,7 +5917,8 @@ class App:
         self.cmb_window_pick.pack(side="left", fill="x", expand=True)
         ttk.Button(pick, text="掃描", width=5, command=self.refresh_window_list).pack(side="left", padx=(4, 0))
         ttk.Button(pick, text="使用", width=5, command=self.use_selected_window).pack(side="left", padx=(4, 0))
-        hint(box2, "標題只要包含部分文字即可；找不到遊戲時，從下拉清單選取遊戲視窗按「使用」。", pady=(3, 0))
+        hint(box2, "標題只要包含部分文字即可；找不到遊戲時，從下拉清單選取遊戲視窗按「使用」。"
+                   "開始／暫停熱鍵只在遊戲或本工具在前景時有效；緊急停止隨時有效。", pady=(3, 0))
         bg = ttk.Frame(box2)
         bg.pack(fill="x", pady=(4, 0))
         ttk.Button(bg, text="背景運行測試", command=self.background_test).pack(side="left")
@@ -6114,7 +6155,6 @@ class App:
         e.bind("<FocusOut>", lambda _e: self.save_settings())
         e.bind("<Return>", lambda _e: self.save_settings())
         ttk.Label(pre, text="格內").pack(side="left")
-        hint(box2, "開始／暫停熱鍵只在遊戲或本工具在前景時有效；緊急停止隨時有效。", pady=(4, 0))
 
     def open_diag_dir(self):
         os.makedirs(DIAG_DIR, exist_ok=True)
@@ -6220,7 +6260,7 @@ class App:
             ("keys", "確認遊戲按鍵", "跳躍、攻擊、方向鍵要和遊戲內一致，按「測試跳躍」確認。",
              lambda: bool(c.get("setup_keys_ok")),
              [("按鍵設定", lambda: self.open_shared("keys")), ("測試跳躍", self.test_jump)], ALL, set()),
-            ("points", pt[0], pt[1], pt[2], [("到掛機地圖", lambda: self.nb.select(self.tab_home))], ALL, set()),
+            ("points", pt[0], pt[1], pt[2], [("到掛機地圖", self.goto_mode_page)], ALL, set()),
             ("tag", "框選角色名牌", "框選自己角色腳下的名牌（不要框到角色）。設定物品範本後，撿物功能才需要它。",
              lambda: sc.tag_template is not None, [("框選名牌", self.set_nametag)], set(), {"buff"}),
             ("mob", "框選怪物範本", "框選這張地圖的怪物，不同動作可多存幾張。",
@@ -6520,7 +6560,7 @@ class App:
         g = self.skill_grid
         for w in g.winfo_children():
             w.destroy()
-        for c, t in enumerate(("啟用", "名稱", "按鍵", "每隔(秒)", "施放後等待", "圖示", "")):
+        for c, t in enumerate(("啟用", "名稱", "按鍵", "每隔秒", "等待秒", "圖示", "")):
             ttk.Label(g, text=t, style="Hint.TLabel").grid(row=0, column=c, sticky="w", padx=2)
         g.columnconfigure(1, weight=1)
         self.skill_rows = []
@@ -6538,17 +6578,17 @@ class App:
             e = ttk.Entry(g, textvariable=name, width=9)
             e.grid(row=r, column=1, sticky="we", padx=2, pady=1)
             entries.append(e)
-            make_choice(g, key, KEY_SPEC, width=7, on_change=save).grid(row=r, column=2, padx=2, pady=1)
+            make_choice(g, key, KEY_SPEC, width=6, on_change=save).grid(row=r, column=2, padx=2, pady=1)
             for col, var in ((3, itv), (4, dly)):
-                e = ttk.Entry(g, textvariable=var, width=6)
+                e = ttk.Entry(g, textvariable=var, width=5)
                 e.grid(row=r, column=col, padx=2, pady=1)
                 entries.append(e)
             for e in entries:
                 e.bind("<FocusOut>", lambda _e, sv=save: sv())
                 e.bind("<Return>", lambda _e, sv=save: sv())
-            ttk.Button(g, text="✓圖示" if sk.get("icon") else "框圖示", width=6,
+            ttk.Button(g, text="✓圖示" if sk.get("icon") else "框圖示", width=5,
                        command=lambda i=i: self.set_buff_icon(i)).grid(row=r, column=5, padx=2)
-            ttk.Button(g, text="✕", width=3, command=lambda i=i: self.del_skill(i)).grid(row=r, column=6, padx=(2, 0))
+            ttk.Button(g, text="✕", width=2, command=lambda i=i: self.del_skill(i)).grid(row=r, column=6, padx=(2, 0))
             self.skill_rows.append((on, name, key, itv, dly))
         if not self.cfg["skills"]:
             ttk.Label(g, text="尚未新增技能", style="Hint.TLabel").grid(row=1, column=0, columnspan=7, sticky="w")

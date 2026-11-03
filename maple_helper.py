@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.2.0"
+APP_VERSION = "v4.2.2"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -61,7 +61,10 @@ MAP_PROFILE_KEYS = (
     "minimap", "player_hsv_low", "player_hsv_high", "min_dot_area",
     "route", "route_loop", "patrol", "patrol_opt", "goto_tolerance", "rope_tolerance",
     "anchor", "mode", "loot", "map_macro", "map_macros", "map_macro_options",
+    "player_area_ref", "minimap_ignore", "last_player_pos",
 )
+# 換地圖時，這些「角色點判斷」的資料如果新配置沒有，就清掉（不沿用上一張地圖的位置）
+MAP_RESET_KEYS = ("minimap_ignore", "last_player_pos")
 
 # --------------------------------------------------------------------------
 # 設定
@@ -93,6 +96,8 @@ DEFAULT_CONFIG = {
                    "x_jitter": 4, "plat_tol": 4, "rope_as_target": True},
     "goto_tolerance": 3,
     "rope_tolerance": 1,
+    # 已經成功定位過角色後，若座標持續遺失超過此秒數就安全暫停，避免盲目送按鍵。
+    "position_lost_sec": 3.0,
     "only_when_focused": True,
     "diagnostics": False,          # 記錄診斷資料（小地圖影片＋按鍵與座標紀錄）
     "key_repeat": True,            # 按住的鍵持續送出訊號（模擬實體鍵盤按住）
@@ -208,7 +213,7 @@ BUILTIN_MODEL = {
     "file": "monster_current_map_v2.pt",
     "version": "map_multiclass_v4",
     "sha256": "18443e6e2cfa60229b91349ccf5d281f2153d794e9815196fb56961f56cf9047",
-    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.2.0/monster_current_map_v2.pt",
+    "url": "https://github.com/sparklerkao-tech/maple-helper/releases/download/v4.2.2/monster_current_map_v2.pt",
 }
 
 
@@ -863,6 +868,7 @@ class PlayerTracker:
 
     def __init__(self):
         self.pos = None
+        self.pos_seen_at = 0.0    # 最後一次可靠取得角色小地圖座標的時間
         self.prev = []
         self.last_move = 0.0
         self.missing_since = None
@@ -879,8 +885,13 @@ class PlayerTracker:
             return min(cands, key=lambda c: (abs(c[2] - ref), c[2]))
         return min(cands, key=lambda c: c[2])
 
-    def update(self, cands, now=None, ref_area=None):
+    def update(self, cands, now=None, ref_area=None, ignore=None, expect_move=True):
+        """ignore＝取色時記下、不動的同色圖示位置（還有別的色塊時不選它們）；
+        expect_move＝工具正在按方向鍵（角色應該在動）。角色站著打怪時，別的色塊在動也不會改跟它"""
         now = time.time() if now is None else now
+        if ignore and len(cands) > 1:
+            keep = [c for c in cands if not any(abs(c[0] - i[0]) <= 2 and abs(c[1] - i[1]) <= 2 for i in ignore)]
+            cands = keep or cands
         self.candidates = cands
         if not cands:
             self.prev = []
@@ -904,8 +915,8 @@ class PlayerTracker:
             near = min(cands, key=lambda c: (c[0] - self.pos[0]) ** 2 + (c[1] - self.pos[1]) ** 2)
             dist = max(abs(near[0] - self.pos[0]), abs(near[1] - self.pos[1]))
             pick = near if dist <= 20 else self._by_area(moved or cands, ref_area)
-        if moved and pick not in moved and now - self.last_move > 1.0:
-            pick = self._by_area(moved, ref_area)   # 目前跟的點一直不動，別的點在動 → 那才是角色
+        if expect_move and moved and pick not in moved and now - self.last_move > 1.0:
+            pick = self._by_area(moved, ref_area)   # 正在走路，目前跟的點卻一直不動，別的點在動 → 那才是角色
         p = (pick[0], pick[1])
         if p != self.pos:
             self.last_move = now
@@ -1664,9 +1675,30 @@ class Vision(threading.Thread):
                     img = np.ascontiguousarray(np.array(shot)[:, :, :3])
                     cands = player_candidates(img, cfg["player_hsv_low"], cfg["player_hsv_high"],
                                               cfg["min_dot_area"])
+                    kb = getattr(self.app, "kb", None)
+                    walking = False
+                    if kb is not None:
+                        now_ = time.time()
+                        keys = cfg.get("keys", {})
+                        for d in (keys.get("left", "left"), keys.get("right", "right")):
+                            since = kb.held_since.get(d) if d in kb.held else None
+                            if since is not None and now_ - since >= 0.3:
+                                walking = True
                     with self.lock:
-                        p = self.tracker.update(cands, ref_area=cfg.get("player_area_ref"))
+                        if (not getattr(self, "_first_seed_done", False) and self.tracker.pos is None
+                                and cfg.get("last_player_pos") and len(cands) > 1):
+                            # 剛開程式：先跟上次停止時的位置附近那個色塊（角色通常還站在原地）
+                            lx, ly = cfg["last_player_pos"]
+                            near = min(cands, key=lambda c: (c[0] - lx) ** 2 + (c[1] - ly) ** 2)
+                            if max(abs(near[0] - lx), abs(near[1] - ly)) <= 6:
+                                self.tracker.seed(near[0], near[1])
+                        p = self.tracker.update(cands, ref_area=cfg.get("player_area_ref"),
+                                                ignore=cfg.get("minimap_ignore"), expect_move=walking)
+                        if p is not None:
+                            self._first_seed_done = True
                         self.pos, self.minimap = p, img
+                        if p is not None:
+                            self.pos_seen_at = time.time()
                     self.check_red_dots(img)
                 if sct:
                     self.check_screen(sct)
@@ -2119,6 +2151,17 @@ class Bot(threading.Thread):
                 self.status = "遊戲視窗不在前景，等待中…"
                 time.sleep(0.3)
                 continue
+            # 遊戲仍在前景卻長時間失去角色座標時，繼續走／攻擊只會讓路線越跑越偏。
+            # 只在「先前確實抓到過座標」後啟用，避免剛開程式時畫面辨識尚未就緒就誤停。
+            last_seen = float(getattr(self.app.vision, "pos_seen_at", 0.0) or 0.0)
+            lost_limit = float(self.cfg.get("position_lost_sec", 3.0))
+            if self.cfg.get("minimap") and last_seen and time.time() - last_seen >= lost_limit:
+                self.kb.release_all()
+                self.active.clear()
+                self.status = "角色座標遺失，已安全暫停"
+                self.app.trigger_alarm("stuck", f"角色座標已遺失超過 {lost_limit:g} 秒，已安全暫停",
+                                       pause=False, beep=True)
+                raise StopBot()
             return
 
     def sleep(self, sec, do_skills=True):
@@ -2279,6 +2322,43 @@ class Bot(threading.Thread):
         while time.time() < end:
             self.check(allow_elite=False)
             time.sleep(min(0.03, max(0, end - time.time())))
+
+    def confirm_player(self):
+        """開始時小地圖上有不只一個同色色塊：左右各走一小步，看哪一個跟著動，確定那個才是角色。
+        避免一開始跟錯色塊，以為角色在很遠的地方而一路跑過去"""
+        v = self.app.vision
+        if not self.cfg.get("minimap"):
+            return
+        with v.lock:
+            cands = list(v.tracker.candidates)
+        if len(cands) <= 1:
+            return
+        self.status = f"小地圖上有 {len(cands)} 個同色色塊，左右走一小步確認哪個是角色…"
+        for key in (self.key("right"), self.key("left")):
+            self.check(allow_elite=False)
+            with v.lock:
+                before = list(v.tracker.candidates)
+            self.kb.tap(key, 0.25)
+            self.quiet_wait(0.25)
+            with v.lock:
+                after = list(v.tracker.candidates)
+            moved = []
+            for c in after:
+                d = min((max(abs(c[0] - b[0]), abs(c[1] - b[1])) for b in before), default=99)
+                if 1 <= d <= 8:
+                    moved.append(c)
+            if len(moved) == 1:
+                c = moved[0]
+                with v.lock:
+                    old = v.tracker.pos
+                    v.tracker.seed(c[0], c[1])
+                    v.pos = (c[0], c[1])
+                if old and max(abs(old[0] - c[0]), abs(old[1] - c[1])) > 2:
+                    log(f"開始時確認角色點：原本跟到 ({old[0]},{old[1]})，改成會動的 ({c[0]},{c[1]})", "warn")
+                else:
+                    log(f"開始時確認角色點：({c[0]},{c[1]})")
+                return
+        log("開始時確認角色點：左右走了一步，小地圖上沒有單一一個色塊跟著動（可能靠牆）；沿用目前的判斷", "warn")
 
     def cast_startup_buffs(self):
         """每次按開始時先完整輪流放一輪 Buff，全部放完、動作結束後，才進入任何攻擊／移動流程。
@@ -3706,6 +3786,7 @@ class Bot(threading.Thread):
                     self.cast_startup_buffs()
                     if not self.active.is_set():
                         continue
+                    self.confirm_player()
                 self.check()
                 if self.cfg.get("mode") == "anchor":
                     self.anchor_once()
@@ -4690,11 +4771,14 @@ class App:
         for key in MAP_PROFILE_KEYS:
             if key in data:
                 self.cfg[key] = data[key]
+            elif key in MAP_RESET_KEYS:
+                self.cfg.pop(key, None)
         self.cfg = migrate_config(self.cfg)
         self.cfg["active_profile"] = name
         self.kb.repeat = self.cfg.get("key_repeat", True)
         self.vision.hwnd = None
         self.vision.tracker = PlayerTracker()
+        self.vision._first_seed_done = False
         self.bot.last_target = None
         self.bot.anchor_dwell = None
         self.bot.step_idx = 0
@@ -6142,7 +6226,7 @@ class App:
         self.var_restore = tk.BooleanVar(value=self.cfg.get("restore_on_pause", True))
         ttk.Checkbutton(box2, text="按開始時自動縮小本工具，並切到遊戲", variable=self.var_min_start,
                         command=self.save_settings).pack(anchor="w")
-        ttk.Checkbutton(box2, text="暫停／停止時自動還原本工具視窗", variable=self.var_restore,
+        ttk.Checkbutton(box2, text="暫停（F10）時自動還原本工具視窗", variable=self.var_restore,
                         command=self.save_settings).pack(anchor="w")
         self.var_prehold = tk.BooleanVar(value=self.cfg.get("rope_prehold", True))
         pre = ttk.Frame(box2)
@@ -7616,6 +7700,8 @@ class App:
 
     def on_minimap_selected(self, rect):
         self.cfg["minimap"] = list(rect)
+        for k in MAP_RESET_KEYS:          # 小地圖框改了，座標也跟著變：舊的忽略位置／上次位置作廢
+            self.cfg.pop(k, None)
         save_config(self.cfg)
 
     def pick_color(self):
@@ -7643,8 +7729,12 @@ class App:
                     with self.vision.lock:
                         self.vision.tracker.seed(c[0], c[1])
                     msg = f"已鎖定角色點（大小 {c[2]} px）"
-                    if len(cands) > 1:
-                        msg += f"；小地圖上另有 {len(cands) - 1} 個同色色塊，會自動忽略不動的那些"
+                    others = [[o[0], o[1]] for o in cands if o is not c]
+                    self.cfg["minimap_ignore"] = others
+                    self.cfg["last_player_pos"] = [c[0], c[1]]
+                    if others:
+                        msg += (f"；小地圖上另有 {len(others)} 個同色色塊（{'、'.join(f'({o[0]},{o[1]})' for o in others)}），"
+                                "已記住它們的位置，之後不會跟錯")
         save_config(self.cfg)
         self.notify(msg)
 
@@ -7966,14 +8056,21 @@ class App:
             log(f"開始掛機：{MODE_INFO.get(mode, (mode,))[0]}（Buff {n_buff} 個）")
             self._after_start()
 
+    def remember_player_pos(self):
+        p = self.vision.get_pos()
+        if p and self.cfg.get("last_player_pos") != [p[0], p[1]]:
+            self.cfg["last_player_pos"] = [p[0], p[1]]
+            save_config(self.cfg)
+
     def stop(self):
+        """停止掛機（F12）：只停下來、放開按鍵，不把工具視窗跳出來"""
         was_running = self.bot.active.is_set()
         self.bot.active.clear()
         self.bot.step_idx = 0
         self.kb.release_all()
         if was_running:
             log("停止掛機")
-            self._after_pause()
+            self.remember_player_pos()
 
     def _hotkey_focus_ok(self):
         """熱鍵只在遊戲視窗或本工具視窗在前景時作用，避免在其他程式誤觸"""
@@ -8107,6 +8204,10 @@ class App:
 
     def on_close(self):
         log("關閉工具")
+        try:
+            self.remember_player_pos()
+        except Exception:
+            pass
         if self._on_log in EVENT_LOG.listeners:
             EVENT_LOG.listeners.remove(self._on_log)
         self.alive_ui = False

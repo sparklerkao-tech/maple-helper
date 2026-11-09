@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.2.5"
+APP_VERSION = "v4.2.6"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -4353,8 +4353,10 @@ class App:
         self._drain_ui()
         self.refresh()
         self.poll_hotkeys()
+        # 更新後可能是直接開舊的 .py／.exe，沒有經過啟動.bat；程式本身也要能補裝 YOLO。
+        self.root.after(700, self.ensure_yolo_runtime)
         self.root.after(1200, self.check_for_updates)
-        self.root.after(3000, self.check_model_present)
+        self.root.after(3500, self.check_model_present)
         # 啟動時只看存檔的設定（遊戲視窗、角色點要等辨識跑起來才知道）
         if self.missing_required(skip=("game", "dot")):
             self.nb.select(self.tab_setup)
@@ -5458,6 +5460,42 @@ class App:
                 err = f"下載內建模型失敗：{e}"
                 log_exception("下載內建模型失敗", e)
                 self.ui(lambda: self.notify(err, error=True))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def ensure_yolo_runtime(self):
+        """缺少 ultralytics 時自動安裝，避免使用者直接開舊 .py／.exe 後仍沒有 YOLO。"""
+        if not self.cfg.get("yolo", {}).get("enabled", True) or getattr(self, "_yolo_install_started", False):
+            return
+        try:
+            import ultralytics  # noqa: F401 - 只檢查模組可否使用
+            return
+        except Exception:
+            pass
+        self._yolo_install_started = True
+        self.notify("第一次使用 YOLO，正在自動安裝 AI 引擎；請保持網路連線，可能需要幾分鐘…")
+
+        def worker():
+            # .py 直接執行時用目前的 Python；打包版沒有 pip 時，退回 Windows 的 Python 啟動器。
+            cmd = ([sys.executable, "-m", "pip", "install", "ultralytics>=8.3"]
+                   if not getattr(sys, "frozen", False)
+                   else ["py", "-3", "-m", "pip", "install", "ultralytics>=8.3"])
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=900,
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                if result.returncode != 0:
+                    tail = (result.stderr or result.stdout or "未知錯誤").strip().splitlines()[-1]
+                    raise RuntimeError(tail)
+                try:
+                    import ultralytics  # noqa: F401
+                except Exception as e:
+                    raise RuntimeError(f"安裝後仍無法載入：{e}") from e
+                self.scanner.yolo.invalidate()
+                self.ui(lambda: (self.notify("YOLO AI 引擎安裝完成，正在檢查模型…"),
+                                 self.update_yolo_model_label(), self.check_model_present()))
+            except Exception as e:
+                log_exception("自動安裝 YOLO 失敗", e)
+                err = str(e)
+                self.ui(lambda err=err: self.notify(f"YOLO 自動安裝失敗：{err}；請改用啟動.bat 開啟一次。", error=True))
         threading.Thread(target=worker, daemon=True).start()
 
     def check_model_present(self):

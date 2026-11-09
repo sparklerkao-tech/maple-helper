@@ -15,10 +15,10 @@ if not defined PY (
     exit /b 1
 )
 
-rem ---- 只有缺少套件時才安裝 ----
-%PY% -c "import mss, numpy, cv2, PIL" >nul 2>&1
+rem ---- 只有缺少套件時才安裝；YOLO 第一次會連同 PyTorch 一起下載，請耐心等候 ----
+%PY% -c "import mss, numpy, cv2, PIL, ultralytics" >nul 2>&1
 if errorlevel 1 (
-    echo 第一次執行，正在安裝需要的套件...
+    echo 第一次執行，正在安裝需要的套件與 YOLO AI 引擎，可能需要幾分鐘...
     %PY% -m pip install -r requirements.txt
     if errorlevel 1 (
         echo [錯誤] 套件安裝失敗，請確認網路連線後再試一次。

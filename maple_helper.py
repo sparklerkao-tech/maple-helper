@@ -50,7 +50,7 @@ if IS_WIN:
         except Exception:
             pass
 
-APP_VERSION = "v4.2.2"
+APP_VERSION = "v4.2.5"
 UPDATE_REPOSITORY = "sparklerkao-tech/maple-helper"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
 MODE_NAMES = {"buff": "BUFF機", "anchor": "定點掛機"}
@@ -79,6 +79,9 @@ DEFAULT_CONFIG = {
              "up": "up", "down": "down"},
     "attack": {"enabled": False, "interval": 0.6},
     "buff_start_wait": 1.0,   # 開始時放完全部 Buff 後，再等幾秒才開始移動（等最後一個 Buff 動作結束）
+    # 右上 Buff 圖示的「大範圍」，以遊戲客戶區的比例儲存。設定一次後，
+    # 自動學習與後續圖示確認都只在這裡找，不會掃到右上角以外的相似畫面。
+    "buff_icon_region": None,
     "rope_prehold": True,     # 快走到繩子時先按住上（不用跳的繩子），到繩下馬上抓住
     "rope_prehold_dist": 4,   # 距離繩子幾格（小地圖 px）內開始先按住上
     "skills": [
@@ -1112,22 +1115,75 @@ def find_rope_anchor(img_bgr, tag_tpl, anchor_gray, meta, search=None, thr=None)
     return m["want"], m["cx"], m["score"]
 
 
-def buff_bar(img_bgr):
-    """遊戲畫面上方的 Buff 圖示列（右上角）：回傳灰階裁切"""
+def buff_bar(img_bgr, region=None):
+    """Buff 圖示搜尋區（灰階）。region 是 [x比例, y比例, w比例, h比例]。"""
     H, W = img_bgr.shape[:2]
+    if region and len(region) == 4:
+        try:
+            rx, ry, rw, rh = (float(v) for v in region)
+            x, y = max(0, int(rx * W)), max(0, int(ry * H))
+            w, h = min(W - x, int(rw * W)), min(H - y, int(rh * H))
+            if w >= 8 and h >= 8:
+                return cv2.cvtColor(img_bgr[y:y + h, x:x + w], cv2.COLOR_BGR2GRAY)
+        except (TypeError, ValueError):
+            pass
+    # 相容舊設定：尚未設定大範圍時沿用原本右上方的寬鬆搜尋區。
     return cv2.cvtColor(img_bgr[0:min(H, 140), W // 3:W], cv2.COLOR_BGR2GRAY)
 
 
-def buff_icon_present(img_bgr, icon_gray, thr=0.8):
+def buff_icon_present(img_bgr, icon_gray, thr=0.8, region=None):
     """Buff 圖示是否在畫面上方的 Buff 列裡。回傳 (有沒有, 相似度)；畫面或圖示有問題回傳 (None, 0)"""
     if img_bgr is None or icon_gray is None:
         return None, 0.0
-    bar = buff_bar(img_bgr)
+    bar = buff_bar(img_bgr, region)
     h, w = icon_gray.shape[:2]
     if h > bar.shape[0] or w > bar.shape[1]:
         return None, 0.0
     _, mx, _, _ = cv2.minMaxLoc(cv2.matchTemplate(bar, icon_gray, cv2.TM_CCOEFF_NORMED))
     return mx >= thr, float(mx)
+
+
+def learn_buff_icon_from_frames(before_bgr, after_bgr, region):
+    """從同一個 Buff 區的前後畫面找出新出現的圖示。
+
+    回傳 (圖示 BGR, 分數)；畫面只有倒數動畫、沒有可用的新圖示時回傳 (None, 0)。
+    這個保守判定寧可要求使用者以手動框選補一次，也不會把錯誤的小圖覆蓋進設定。
+    """
+    if before_bgr is None or after_bgr is None or not region:
+        return None, 0.0
+    H, W = after_bgr.shape[:2]
+    try:
+        rx, ry, rw, rh = (float(v) for v in region)
+        x, y = max(0, int(rx * W)), max(0, int(ry * H))
+        w, h = min(W - x, int(rw * W)), min(H - y, int(rh * H))
+    except (TypeError, ValueError):
+        return None, 0.0
+    if w < 12 or h < 12 or before_bgr.shape[:2] != after_bgr.shape[:2]:
+        return None, 0.0
+    a = cv2.cvtColor(before_bgr[y:y + h, x:x + w], cv2.COLOR_BGR2GRAY)
+    b = cv2.cvtColor(after_bgr[y:y + h, x:x + w], cv2.COLOR_BGR2GRAY)
+    # 合併相鄰的像素變化，使圖示的數字、光效不會被拆成許多小框。
+    diff = cv2.absdiff(cv2.GaussianBlur(a, (3, 3), 0), cv2.GaussianBlur(b, (3, 3), 0))
+    mask = cv2.threshold(diff, 28, 255, cv2.THRESH_BINARY)[1]
+    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=2)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    for c in contours:
+        bx, by, bw, bh = cv2.boundingRect(c)
+        # Buff 小圖通常接近正方形；整列重排或其他 UI 大幅變化不採用。
+        if not (12 <= bw <= 96 and 12 <= bh <= 96 and 0.45 <= bw / bh <= 2.1):
+            continue
+        score = float(diff[by:by + bh, bx:bx + bw].mean()) * (bw * bh) ** 0.5
+        if best is None or score > best[0]:
+            best = (score, bx, by, bw, bh)
+    if best is None:
+        return None, 0.0
+    score, bx, by, bw, bh = best
+    pad = 2
+    bx, by = max(0, bx - pad), max(0, by - pad)
+    ex, ey = min(w, bx + bw + 2 * pad), min(h, by + bh + 2 * pad)
+    icon = after_bgr[y + by:y + ey, x + bx:x + ex].copy()
+    return icon if icon.size else None, score
 
 
 def analyze_combat(img_bgr, cb, mon_tpls, tag_tpl, yolo=None):
@@ -2195,7 +2251,7 @@ class Bot(threading.Thread):
             img = img if img is not None else self.app.vision.grab_client()
         except Exception:
             img = None
-        return buff_icon_present(img, icon)[0]
+        return buff_icon_present(img, icon, region=self.cfg.get("buff_icon_region"))[0]
 
     def wait_still(self, stable=0.3, timeout=2.0):
         """等角色站穩（小地圖座標連續 stable 秒不變）。被怪撞飛、跳在空中、還在滑行時放 Buff 會被遊戲吃掉"""
@@ -2213,7 +2269,11 @@ class Bot(threading.Thread):
         return False
 
     def due_skills(self, now):
-        """該放的 Buff：時間到了，或有設圖示且圖示已經消失一段時間（Buff 提早沒了、上次沒放出來）"""
+        """該放的 Buff：以設定間隔為主；圖示只在接近到期時作輔助補放。
+
+        Buff 列會因新增技能、圖示排序與倒數動畫而短暫改變，不能因一兩次找不到圖示
+        就立刻重放，否則會造成不同持續時間的技能被反覆施放。
+        """
         due = []
         check_icons = now - self.__dict__.get("_icon_check_at", 0) >= 2.0
         if check_icons:
@@ -2226,7 +2286,10 @@ class Bot(threading.Thread):
             if now - self.skill_last.get(i, 0) >= float(s["interval"]):
                 due.append((i, s, "時間到"))
                 continue
-            if check_icons and s.get("icon") and now - self.skill_last.get(i, 0) >= 8:
+            elapsed = now - self.skill_last.get(i, 0)
+            # 圖示提早消失只在設定週期的後段才採信：最少等 10 秒，避免圖示列重排時誤補放。
+            early_check_after = max(10.0, float(s["interval"]) * 0.75)
+            if check_icons and s.get("icon") and elapsed >= early_check_after:
                 if img is None:
                     try:
                         img = self.app.vision.grab_client()
@@ -2234,7 +2297,7 @@ class Bot(threading.Thread):
                         img = None
                 st = self.icon_state(s, img)
                 miss[i] = miss.get(i, 0) + 1 if st is False else 0
-                if miss[i] >= 3:           # 連續 3 次（約 6 秒）都看不到圖示：補放
+                if miss[i] >= 4:           # 連續 4 次（約 8 秒）都看不到圖示，才在接近到期時補放
                     miss[i] = 0
                     due.append((i, s, "畫面上看不到 Buff 圖示"))
         return due
@@ -2269,37 +2332,35 @@ class Bot(threading.Thread):
                         self.kb.down(k)
 
     def tap_buff_confirm(self, i, s, label, why="時間到", wait=None):
-        """按 Buff 鍵；有框圖示就確認圖示出現，沒有就重放（最多 3 次）。
-        wait＝等待用的函式（定時用 time.sleep；開始時用 quiet_wait，不被菁英中斷）。回傳是否確定放出來"""
+        """按一次 Buff 鍵並檢查圖示，但不因單次辨識失敗連續重放。
+
+        圖示確認失敗時仍保留設定的施放間隔；後續只會在接近到期時保守補放。
+        wait＝等待用的函式（定時用 time.sleep；開始時用 quiet_wait，不被菁英中斷）。
+        """
         wait = wait or time.sleep
         has_icon = self.buff_icon(s) is not None
-        tries = 3 if has_icon else 1
         tail = "" if why == "時間到" else f"（{why}）"
-        for t in range(tries):
-            self.check(allow_elite=False)
-            if not self.wait_still():
-                log(f"{label}：{s['name']}：角色一直在動（被怪撞？），還是先按", "warn")
-            self.kb.tap(s["key"], 0.1)
-            self.skill_last[i] = time.time()
-            wait(max(0.0, float(s.get("delay", 0.6))))
-            if not has_icon:
-                log(f"{label}：{s['name']}{tail}")
-                return True
-            ok = None
-            for _ in range(4):                 # 圖示出現可能慢一點，最多再看 0.8 秒
-                ok = self.icon_state(s)
-                if ok is not False:
-                    break
-                wait(0.2)
+        self.check(allow_elite=False)
+        if not self.wait_still():
+            log(f"{label}：{s['name']}：角色一直在動（被怪撞？），還是先按", "warn")
+        self.kb.tap(s["key"], 0.1)
+        self.skill_last[i] = time.time()
+        self.__dict__.setdefault("_icon_miss", {})[i] = 0
+        wait(max(0.0, float(s.get("delay", 0.6))))
+        if not has_icon:
+            log(f"{label}：{s['name']}{tail}")
+            return True
+        ok = None
+        for _ in range(4):                     # 圖示出現可能慢一點，最多再看 0.8 秒
+            ok = self.icon_state(s)
             if ok is not False:
-                log(f"{label}：{s['name']}{tail}" + ("，已確認圖示出現" if ok else "")
-                    + (f"（第 {t + 1} 次才成功）" if t else ""))
-                return True
-            log(f"{label}：{s['name']}：畫面上沒看到圖示，重放（{t + 1}/{tries}）", "warn")
-        # 重放幾次都沒成功：20 秒後再試，不用等完整的間隔
-        self.skill_last[i] = time.time() - float(s["interval"]) + 20
-        log(f"{label}：{s['name']} 連續 {tries} 次都沒看到圖示（MP 不夠？按鍵設錯？圖示要重框？），20 秒後再試", "warn")
-        return False
+                break
+            wait(0.2)
+        if ok is False:
+            log(f"{label}：{s['name']}：暫時沒確認到圖示；維持原本施放間隔，不連續重放", "warn")
+        else:
+            log(f"{label}：{s['name']}{tail}" + ("，已確認圖示出現" if ok else ""))
+        return True
 
     def tick_skills(self, allow_attack=False):
         if self.climbing:
@@ -5400,13 +5461,16 @@ class App:
         threading.Thread(target=worker, daemon=True).start()
 
     def check_model_present(self):
-        """開啟時：YOLO 已啟用但模型檔不在（例如新電腦），詢問是否下載內建模型"""
+        """開啟時：新電腦缺內建 YOLO 模型就自動下載；既有舊模型仍先詢問。"""
         yc = self.cfg.get("yolo", {})
         path = self.scanner.yolo.model_path()
         if not yc.get("enabled", True) or os.path.basename(path) != BUILTIN_MODEL["file"]:
             return          # 用自己訓練、另外命名的模型：不干涉
         if not os.path.isfile(path):
-            self.offer_model_update("這台電腦還沒有 YOLO 模型檔。")
+            # 新電腦沒有任何內建模型時，不需要使用者再找下載按鈕；背景直接補齊，
+            # 下載失敗會在右下狀態提示，且不影響其他非 YOLO 功能。
+            log("這台電腦沒有 YOLO 模型，開始自動下載內建模型")
+            self.update_builtin_model()
             return
         if yc.get("model_declined") == BUILTIN_MODEL["sha256"]:
             return
@@ -5820,10 +5884,14 @@ class App:
         tk.Label(win, image=win._image).pack()
 
     def build_skill(self, f, f_attack=None):
-        box = section(f, "Buff／定時技能", "勾選即啟用，每隔設定秒數自動施放，按開始時先各放一次。「框圖示」＝框右上角 Buff 列的小圖示：確認有沒有放出來、消失時補放。")
+        box = section(f, "Buff／定時技能", "勾選即啟用，每隔設定秒數自動施放，按開始時先各放一次。可先框一次右上 Buff 圖示區，再自動學習已勾選技能；手動框圖示仍可作為備用。")
         self.skill_grid = ttk.Frame(box)
         self.skill_grid.pack(fill="x")
-        button_row(box, [("＋ 新增技能", self.add_skill)])
+        self.lbl_buff_region = ttk.Label(box, text="", style="Hint.TLabel")
+        button_row(box, [("＋ 新增技能", self.add_skill), ("設定右上圖示區", self.set_buff_icon_region),
+                         ("自動學習已勾選", self.learn_enabled_buff_icons)])
+        self.lbl_buff_region.pack(anchor="w", pady=(3, 0))
+        self.update_buff_region_label()
         wait_row = ttk.Frame(box)
         wait_row.pack(fill="x", pady=(6, 0))
         ttk.Label(wait_row, text="開始時放完 Buff 後再等").pack(side="left")
@@ -6641,6 +6709,8 @@ class App:
         save_config(self.cfg)
 
     def reload_skills(self):
+        # 技能新增／刪除後索引會變，清掉舊圖示遺失計數，避免把 A 技能的狀態套到 B 技能。
+        self.bot.__dict__.pop("_icon_miss", None)
         g = self.skill_grid
         for w in g.winfo_children():
             w.destroy()
@@ -6755,7 +6825,7 @@ class App:
             self.bot.__dict__.pop("_icon_cache", None)
             save_config(self.cfg)
             self.reload_skills()
-            found, score = buff_icon_present(img, self.bot.buff_icon(sk))
+            found, score = buff_icon_present(img, self.bot.buff_icon(sk), region=self.cfg.get("buff_icon_region"))
             if found:
                 self.notify(f"「{sk.get('name')}」的 Buff 圖示已設定：放完會確認有沒有放出來，圖示消失也會提早補放。")
             else:
@@ -6764,6 +6834,96 @@ class App:
 
         RectSelector(self.root, img, done,
                      title=f"先放「{sk.get('name')}」，再框選畫面右上角 Buff 列裡它的小圖示（只框一個圖示），按 Enter 確認")
+
+    def update_buff_region_label(self):
+        if not hasattr(self, "lbl_buff_region"):
+            return
+        r = self.cfg.get("buff_icon_region")
+        self.lbl_buff_region.config(text=("右上圖示區：已設定（自動學習與確認只會在此範圍搜尋）"
+                                         if r else "右上圖示區：尚未設定（可先設定一次，再按「自動學習已勾選」）"))
+
+    def set_buff_icon_region(self):
+        """只框一次右上 Buff 圖示整區；以比例儲存，換解析度仍可沿用。"""
+        img = self.vision.grab_client() if IS_WIN else None
+        if img is None:
+            self.notify("找不到遊戲視窗。", error=True)
+            return
+        H, W = img.shape[:2]
+
+        def done(rect):
+            x, y, w, h = rect
+            if w < 30 or h < 20:
+                self.notify("圖示區太小，請框住右上所有 Buff 小圖可能出現的整個區域。", error=True)
+                return
+            self.cfg["buff_icon_region"] = [round(x / W, 6), round(y / H, 6), round(w / W, 6), round(h / H, 6)]
+            save_config(self.cfg)
+            self.update_buff_region_label()
+            self.notify("右上 Buff 圖示區已設定；接著可按「自動學習已勾選」。")
+
+        RectSelector(self.root, img, done,
+                     title="框選右上角『所有 Buff 小圖可能出現』的整個範圍；不要框技能快捷列，按 Enter 確認")
+
+    def learn_enabled_buff_icons(self):
+        """依序按一次勾選技能，從預先框好的右上區域擷取剛出現的 Buff 小圖。"""
+        if self.bot.active.is_set():
+            self.notify("請先暫停掛機，再執行 Buff 圖示學習。", error=True)
+            return
+        skills = [(i, s) for i, s in enumerate(self.cfg.get("skills", [])) if s.get("enabled")]
+        if not skills:
+            self.notify("請先勾選至少一個要學習的 Buff。", error=True)
+            return
+        if not self.cfg.get("buff_icon_region"):
+            self.notify("請先按「設定右上圖示區」，框住右上 Buff 圖示整區。", error=True)
+            return
+        if self.vision.grab_client() is None:
+            self.notify("找不到遊戲視窗。", error=True)
+            return
+        msg = ("學習期間會依序按一次所有已勾選的技能，並從右上圖示區尋找新圖示。\n\n"
+               "請讓角色站著、不要操作遊戲；最好先等目前 Buff 消失，避免圖示排序大幅改變。\n\n現在開始？")
+        if not messagebox.askyesno("自動學習 Buff 圖示", msg, parent=self.root):
+            return
+        self.notify("正在學習 Buff 圖示；請勿操作遊戲…")
+        threading.Thread(target=self._learn_enabled_buff_icons_worker, args=(skills,), daemon=True).start()
+
+    def _learn_enabled_buff_icons_worker(self, skills):
+        if not activate_window(self.vision.hwnd):
+            self.ui(lambda: self.notify("無法切換到遊戲視窗，已取消學習。", error=True))
+            return
+        time.sleep(0.5)
+        learned, failed = [], []
+        for i, sk in skills:
+            before = self.vision.grab_client()
+            if before is None:
+                failed.append(sk.get("name", f"技能{i + 1}"))
+                break
+            self.kb.tap(sk.get("key", ""), 0.1)
+            time.sleep(max(0.7, min(2.0, float(sk.get("delay", 0.6)) + 0.5)))
+            after = self.vision.grab_client()
+            icon, score = learn_buff_icon_from_frames(before, after, self.cfg.get("buff_icon_region"))
+            if icon is None:
+                failed.append(sk.get("name", f"技能{i + 1}"))
+                continue
+            path = new_template_path(BUFF_ICON_DIR, "buff")
+            if not imwrite_unicode(path, icon):
+                failed.append(sk.get("name", f"技能{i + 1}"))
+                continue
+            old = sk.get("icon")
+            sk["icon"] = os.path.basename(path)
+            self._remove_icon_file(old)
+            learned.append(sk.get("name", f"技能{i + 1}"))
+            log(f"自動學習 Buff 圖示：{sk.get('name')}（變化分數 {score:.0f}）")
+            time.sleep(0.25)
+        self.bot.__dict__.pop("_icon_cache", None)
+        self.bot.__dict__.pop("_icon_miss", None)
+        save_config(self.cfg)
+
+        def finish():
+            self.reload_skills()
+            detail = (f"已學習：{'、'.join(learned)}" if learned else "沒有成功學習到圖示")
+            if failed:
+                detail += f"；請手動框選：{'、'.join(failed)}"
+            self.notify(detail, error=not learned)
+        self.ui(finish)
 
     def _remove_icon_file(self, f):
         if f:
